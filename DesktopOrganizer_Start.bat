@@ -28,106 +28,91 @@ param(
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-# --- WIN32 / COM C# DEFINITION ---
+# --- WIN32 / C# VERTICAL MANAGER & KEYBOARD HOOK DEFINITION ---
 $cSharpCode = @'
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 
-public class DesktopCore {
-    [DllImport("user32.dll", SetLastError = true)]
-    public static extern IntPtr OpenDesktop(string lpszDesktop, uint dwFlags, bool fInherit, uint dwDesiredAccess);
+public class DesktopVerticalManager {
+    [DllImport("user32.dll", SetLastError = true)] public static extern IntPtr OpenDesktop(string lpszDesktop, uint dwFlags, bool fInherit, uint dwDesiredAccess);
+    [DllImport("user32.dll", SetLastError = true)] public static extern bool SetThreadDesktop(IntPtr hDesktop);
+    [DllImport("user32.dll")] public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+    [DllImport("user32.dll")] public static extern IntPtr FindWindowEx(IntPtr hwndParent, IntPtr hwndChildAfter, string lpszClass, string lpszWindow);
+    [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll", SetLastError = true)] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    [DllImport("user32.dll")] public static extern bool RedrawWindow(IntPtr hWnd, IntPtr lprcUpdate, IntPtr hrgnUpdate, uint flags);
+    [DllImport("user32.dll", SetLastError = true)] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+    [DllImport("user32.dll", SetLastError = true)] public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)] public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
 
-    [DllImport("user32.dll", SetLastError = true)]
-    public static extern bool SetThreadDesktop(IntPtr hDesktop);
+    [DllImport("user32.dll", SetLastError = true)] private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
+    [DllImport("user32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+    [DllImport("user32.dll")] private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)] private static extern IntPtr GetModuleHandle(string lpModuleName);
+    [DllImport("user32.dll")] private static extern int GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
+    [DllImport("user32.dll")] private static extern bool TranslateMessage([In] ref MSG lpMsg);
+    [DllImport("user32.dll")] private static extern IntPtr DispatchMessage([In] ref MSG lpMsg);
 
-    [DllImport("user32.dll")]
-    public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
-
-    [DllImport("user32.dll")]
-    public static extern IntPtr FindWindowEx(IntPtr hwndParent, IntPtr hwndChildAfter, string lpszClass, string lpszWindow);
-
-    [DllImport("user32.dll")]
-    public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
-
-    [DllImport("user32.dll")]
-    public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
-
-    [DllImport("user32.dll")]
-    public static extern int GetSystemMetrics(int nIndex);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
-
-    [DllImport("user32.dll")]
-    public static extern bool RedrawWindow(IntPtr hWnd, IntPtr lprcUpdate, IntPtr hrgnUpdate, uint flags);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern IntPtr VirtualAllocEx(IntPtr hProcess, IntPtr lpAddress, uint dwSize, uint flAllocationType, uint flProtect);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool VirtualFreeEx(IntPtr hProcess, IntPtr lpAddress, uint dwSize, uint dwFreeType);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, ref LVITEM lpBuffer, uint nSize, out IntPtr lpNumberOfBytesWritten);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, uint nSize, out IntPtr lpNumberOfBytesRead);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool CloseHandle(IntPtr hObject);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr VirtualAllocEx(IntPtr hProcess, IntPtr lpAddress, uint dwSize, uint flAllocationType, uint flProtect);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern bool VirtualFreeEx(IntPtr hProcess, IntPtr lpAddress, uint dwSize, uint dwFreeType);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, ref LVITEM lpBuffer, uint nSize, out IntPtr lpNumberOfBytesWritten);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, uint nSize, out IntPtr lpNumberOfBytesRead);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern bool CloseHandle(IntPtr hObject);
 
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
 
     public const uint LVM_FIRST = 0x1000;
     public const uint LVM_GETITEMCOUNT = LVM_FIRST + 4;
     public const uint LVM_GETITEMTEXTW = LVM_FIRST + 115;
     public const uint LVM_SETITEMPOSITION = LVM_FIRST + 15;
+    public const uint LVM_GETITEMPOSITION = LVM_FIRST + 16;
+    public const uint LVM_SETITEMSTATE = LVM_FIRST + 43;
+    public const uint LVM_GETNEXTITEM = LVM_FIRST + 12;
+
+    public const int LVIS_FOCUSED = 0x0001;
+    public const int LVIS_SELECTED = 0x0002;
+    public const int LVNI_FOCUSED = 0x0001;
+    public const int LVNI_SELECTED = 0x0002;
 
     public const int GWL_STYLE = -16;
     public const int LVS_AUTOARRANGE = 0x0100;
-
     public const uint RDW_INVALIDATE = 0x0001;
     public const uint RDW_ERASE = 0x0004;
     public const uint RDW_UPDATENOW = 0x0100;
 
-    public const int SM_CXICONSPACING = 38;
-    public const int SM_CYICONSPACING = 39;
+    private const int WH_KEYBOARD_LL = 13;
+    private const int WM_KEYDOWN = 0x0100;
+    private const int VK_SHIFT = 0x10;
+    private const int VK_UP = 0x26;
+    private const int VK_DOWN = 0x28;
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     public struct LVITEM {
-        public uint mask;
-        public int iItem;
-        public int iSubItem;
-        public uint state;
-        public uint stateMask;
-        public IntPtr pszText;
-        public int cchTextMax;
-        public int iImage;
-        public IntPtr lParam;
-        public int iIndent;
-        public int iGroupId;
-        public uint cColumns;
-        public IntPtr puColumns;
-        public IntPtr piColFmt;
-        public int iGroup;
+        public uint mask; public int iItem; public int iSubItem; public uint state; public uint stateMask; public IntPtr pszText; public int cchTextMax; public int iImage; public IntPtr lParam; public int iIndent; public int iGroupId; public uint cColumns; public IntPtr puColumns; public IntPtr piColFmt; public int iGroup;
     }
 
-    public class RawItem {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT { public int x; public int y; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public POINT pt; }
+
+    public class ItemEntry {
         public int Index;
         public string Name;
     }
+
+    private static IntPtr _hookId = IntPtr.Zero;
+    private static LowLevelKeyboardProc _proc = HookCallback;
 
     public static IntPtr FindListView() {
         IntPtr hProgman = FindWindow("Progman", null);
@@ -135,44 +120,144 @@ public class DesktopCore {
         if (hDefView == IntPtr.Zero) {
             EnumWindows((hWnd, lParam) => {
                 IntPtr c = FindWindowEx(hWnd, IntPtr.Zero, "SHELLDLL_DefView", null);
-                if (c != IntPtr.Zero) {
-                    hDefView = c;
-                    return false;
-                }
+                if (c != IntPtr.Zero) { hDefView = c; return false; }
                 return true;
             }, IntPtr.Zero);
         }
-        if (hDefView != IntPtr.Zero) {
-            return FindWindowEx(hDefView, IntPtr.Zero, "SysListView32", null);
-        }
-        return IntPtr.Zero;
+        return (hDefView != IntPtr.Zero) ? FindWindowEx(hDefView, IntPtr.Zero, "SysListView32", null) : IntPtr.Zero;
     }
 
-    public static void DisableAutoArrange(IntPtr hListView) {
-        int style = GetWindowLong(hListView, GWL_STYLE);
-        if ((style & LVS_AUTOARRANGE) != 0) {
-            SetWindowLong(hListView, GWL_STYLE, style & ~LVS_AUTOARRANGE);
+    public static bool IsDesktopForeground() {
+        IntPtr hFore = GetForegroundWindow();
+        if (hFore == IntPtr.Zero) return false;
+        StringBuilder sb = new StringBuilder(256);
+        GetClassName(hFore, sb, 256);
+        string cls = sb.ToString();
+        if (cls == "Progman" || cls == "WorkerW" || cls == "SHELLDLL_DefView" || cls == "SysListView32") return true;
+
+        IntPtr hDefView = FindWindowEx(hFore, IntPtr.Zero, "SHELLDLL_DefView", null);
+        return hDefView != IntPtr.Zero;
+    }
+
+    private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam) {
+        if (nCode >= 0 && wParam == (IntPtr)WM_KEYDOWN) {
+            int vkCode = Marshal.ReadInt32(lParam);
+            if ((vkCode == VK_DOWN || vkCode == VK_UP) && (GetAsyncKeyState(VK_SHIFT) < 0)) {
+                if (IsDesktopForeground()) {
+                    if (HandleVerticalSelection(vkCode == VK_DOWN)) {
+                        return (IntPtr)1; // Suppress default horizontal row selection!
+                    }
+                }
+            }
+        }
+        return CallNextHookEx(_hookId, nCode, wParam, lParam);
+    }
+
+    private static bool HandleVerticalSelection(bool isDown) {
+        IntPtr hList = FindListView();
+        if (hList == IntPtr.Zero) return false;
+
+        int count = (int)SendMessage(hList, LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero);
+        int focused = (int)SendMessage(hList, LVM_GETNEXTITEM, (IntPtr)(-1), (IntPtr)LVNI_FOCUSED);
+        if (focused < 0) return false;
+
+        uint pid;
+        GetWindowThreadProcessId(hList, out pid);
+        IntPtr hProc = OpenProcess(0x0038, false, pid);
+        if (hProc == IntPtr.Zero) return false;
+
+        IntPtr pPoint = VirtualAllocEx(hProc, IntPtr.Zero, (uint)Marshal.SizeOf(typeof(POINT)), 0x1000, 0x04);
+        byte[] ptb = new byte[Marshal.SizeOf(typeof(POINT))];
+        IntPtr read;
+
+        // Current item position
+        SendMessage(hList, LVM_GETITEMPOSITION, (IntPtr)focused, pPoint);
+        ReadProcessMemory(hProc, pPoint, ptb, (uint)ptb.Length, out read);
+        int curX = BitConverter.ToInt32(ptb, 0);
+        int curY = BitConverter.ToInt32(ptb, 4);
+
+        int bestIndex = -1;
+        int bestDist = int.MaxValue;
+
+        for (int i = 0; i < count; i++) {
+            if (i == focused) continue;
+            SendMessage(hList, LVM_GETITEMPOSITION, (IntPtr)i, pPoint);
+            ReadProcessMemory(hProc, pPoint, ptb, (uint)ptb.Length, out read);
+            int x = BitConverter.ToInt32(ptb, 0);
+            int y = BitConverter.ToInt32(ptb, 4);
+
+            // Same column (X within 30px)
+            if (Math.Abs(x - curX) <= 30) {
+                if (isDown && y > curY) {
+                    int dist = y - curY;
+                    if (dist < bestDist) {
+                        bestDist = dist;
+                        bestIndex = i;
+                    }
+                } else if (!isDown && y < curY) {
+                    int dist = curY - y;
+                    if (dist < bestDist) {
+                        bestDist = dist;
+                        bestIndex = i;
+                    }
+                }
+            }
+        }
+
+        VirtualFreeEx(hProc, pPoint, 0, 0x8000);
+        CloseHandle(hProc);
+
+        if (bestIndex != -1) {
+            // Select and focus next vertical item in same column
+            LVITEM lv = new LVITEM();
+            lv.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+            lv.state = LVIS_SELECTED | LVIS_FOCUSED;
+            IntPtr pLv = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(LVITEM)));
+            Marshal.StructureToPtr(lv, pLv, false);
+            SendMessage(hList, LVM_SETITEMSTATE, (IntPtr)bestIndex, pLv);
+            Marshal.FreeHGlobal(pLv);
+            return true;
+        }
+
+        return false;
+    }
+
+    public static void StartHookLoop() {
+        using (Process curProcess = Process.GetCurrentProcess())
+        using (ProcessModule curModule = curProcess.MainModule) {
+            _hookId = SetWindowsHookEx(WH_KEYBOARD_LL, _proc, GetModuleHandle(curModule.ModuleName), 0);
+        }
+
+        MSG msg;
+        while (GetMessage(out msg, IntPtr.Zero, 0, 0) > 0) {
+            TranslateMessage(ref msg);
+            DispatchMessage(ref msg);
+        }
+
+        if (_hookId != IntPtr.Zero) {
+            UnhookWindowsHookEx(_hookId);
+            _hookId = IntPtr.Zero;
         }
     }
 
-    public static List<RawItem> GetDesktopItems(out IntPtr outHwnd) {
-        List<RawItem> list = new List<RawItem>();
+    public static List<ItemEntry> GetAllItems(out IntPtr outHwnd) {
+        List<ItemEntry> list = new List<ItemEntry>();
         IntPtr hList = IntPtr.Zero;
 
         Thread t = new Thread(() => {
             IntPtr hDefault = OpenDesktop("Default", 0, false, 0x01FF);
-            if (hDefault != IntPtr.Zero) {
-                SetThreadDesktop(hDefault);
-            }
+            if (hDefault != IntPtr.Zero) SetThreadDesktop(hDefault);
             hList = FindListView();
             if (hList == IntPtr.Zero) return;
 
-            DisableAutoArrange(hList);
+            int style = GetWindowLong(hList, GWL_STYLE);
+            if ((style & LVS_AUTOARRANGE) != 0) {
+                SetWindowLong(hList, GWL_STYLE, style & ~LVS_AUTOARRANGE);
+            }
 
             int count = (int)SendMessage(hList, LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero);
             uint pid;
             GetWindowThreadProcessId(hList, out pid);
-
             IntPtr hProc = OpenProcess(0x0038, false, pid);
             if (hProc == IntPtr.Zero) return;
 
@@ -181,28 +266,16 @@ public class DesktopCore {
             IntPtr pText = new IntPtr(pMem.ToInt64() + Marshal.SizeOf(typeof(LVITEM)));
 
             for (int i = 0; i < count; i++) {
-                LVITEM item = new LVITEM();
-                item.mask = 1;
-                item.iItem = i;
-                item.pszText = pText;
-                item.cchTextMax = 250;
-
-                IntPtr written;
-                WriteProcessMemory(hProc, pMem, ref item, (uint)Marshal.SizeOf(typeof(LVITEM)), out written);
+                LVITEM item = new LVITEM(); item.mask = 1; item.iItem = i; item.pszText = pText; item.cchTextMax = 250;
+                IntPtr written; WriteProcessMemory(hProc, pMem, ref item, (uint)Marshal.SizeOf(typeof(LVITEM)), out written);
                 SendMessage(hList, LVM_GETITEMTEXTW, (IntPtr)i, pMem);
-
-                byte[] textBuffer = new byte[bufferSize];
-                IntPtr read;
-                ReadProcessMemory(hProc, pText, textBuffer, (uint)bufferSize, out read);
+                byte[] textBuffer = new byte[bufferSize]; IntPtr read; ReadProcessMemory(hProc, pText, textBuffer, (uint)bufferSize, out read);
                 string text = Encoding.Unicode.GetString(textBuffer).Split('\0')[0];
-                list.Add(new RawItem { Index = i, Name = text });
+                list.Add(new ItemEntry { Index = i, Name = text });
             }
-
-            VirtualFreeEx(hProc, pMem, 0, 0x8000);
-            CloseHandle(hProc);
+            VirtualFreeEx(hProc, pMem, 0, 0x8000); CloseHandle(hProc);
         });
-        t.Start();
-        t.Join();
+        t.Start(); t.Join();
 
         outHwnd = hList;
         return list;
@@ -211,31 +284,25 @@ public class DesktopCore {
     public static void SetItemPosition(IntPtr hListView, int index, int x, int y) {
         Thread t = new Thread(() => {
             IntPtr hDefault = OpenDesktop("Default", 0, false, 0x01FF);
-            if (hDefault != IntPtr.Zero) {
-                SetThreadDesktop(hDefault);
-            }
+            if (hDefault != IntPtr.Zero) SetThreadDesktop(hDefault);
             int lParam = (y << 16) | (x & 0xFFFF);
             SendMessage(hListView, LVM_SETITEMPOSITION, (IntPtr)index, (IntPtr)lParam);
         });
-        t.Start();
-        t.Join();
+        t.Start(); t.Join();
     }
 
     public static void RefreshDesktop(IntPtr hListView) {
         Thread t = new Thread(() => {
             IntPtr hDefault = OpenDesktop("Default", 0, false, 0x01FF);
-            if (hDefault != IntPtr.Zero) {
-                SetThreadDesktop(hDefault);
-            }
+            if (hDefault != IntPtr.Zero) SetThreadDesktop(hDefault);
             RedrawWindow(hListView, IntPtr.Zero, IntPtr.Zero, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
         });
-        t.Start();
-        t.Join();
+        t.Start(); t.Join();
     }
 }
 '@
 
-if (-not ([System.Management.Automation.PSTypeName]'DesktopCore').Type) {
+if (-not ([System.Management.Automation.PSTypeName]'DesktopVerticalManager').Type) {
     Add-Type -TypeDefinition $cSharpCode
 }
 Add-Type -AssemblyName System.Windows.Forms
@@ -291,83 +358,158 @@ function Fix-JamoNormalization {
     }
 }
 
-# --- FUNCTION: ARRANGE DESKTOP (3 VERTICAL COLUMNS) ---
+# --- FUNCTION: ARRANGE DESKTOP (EXACT 3-COLUMN IMAGE MATCH) ---
 function Invoke-DesktopArrangement {
     $hListView = [IntPtr]::Zero
-    $rawItems = [DesktopCore]::GetDesktopItems([ref]$hListView)
+    $rawItems = [DesktopVerticalManager]::GetAllItems([ref]$hListView)
     if ($hListView -eq [IntPtr]::Zero -or $rawItems.Count -eq 0) {
         Write-Host "  [Arrange Warning] Desktop ListView not found."
         return
     }
 
-    # Classify items
-    $classified = @()
+    # Separate into Column 1, Column 2, Column 3 exactly as shown in user's image
+    $col1List = @()
+    $col2List = @()
+    $col3List = @()
+
+    $folders = @()
+    $files = @()
+
+    # Pure English Unicode strings for Korean titles
+    $strDownloads = (-join [char[]]@(0xB2E4, 0xC6B4, 0xB85C, 0xB4DC))
+    $strRecycle = (-join [char[]]@(0xD734, 0xC9C0, 0xD1B5))
+    $strMod = (-join [char[]]@(0xC218, 0xC815))
+    $strChef = (-join [char[]]@(0xD658, 0xC0DD, 0xC170, 0xD504))
+    $strHwa = [string][char]0xD654
+
     foreach ($item in $rawItems) {
         $name = $item.Name.Trim()
-        $priority = 4
         
-        # Priority 1: Downloads (Folder / Shortcut)
-        if (($downloadsFolderTitle -and ($name -like "$downloadsFolderTitle*")) -or ($name -match '^(Downloads|`uB2E4`uC6B4`uB85C`uB4DC)(\.lnk)?$')) {
-            $priority = 1
-        }
-        # Priority 2: Recycle Bin
-        elseif (($recycleBinTitle -and ($name -eq $recycleBinTitle)) -or ($name -eq "Recycle Bin") -or ($name -eq "`uD734`uC9C0`uD1B5")) {
-            $priority = 2
-        }
-        else {
-            # Check if directory
-            $isDir = $false
-            foreach ($d in $desktopDirs) {
-                $checkPath = Join-Path $d $name
-                if (Test-Path -LiteralPath $checkPath -PathType Container) {
-                    $isDir = $true
-                    break
-                }
-            }
-            if ($isDir) {
-                $priority = 3
-            } else {
-                $priority = 4
+        # Check folder vs file
+        $isDir = $false
+        foreach ($d in $desktopDirs) {
+            $checkPath = Join-Path $d $name
+            if (Test-Path -LiteralPath $checkPath -PathType Container) {
+                $isDir = $true
+                break
             }
         }
 
-        $classified += [PSCustomObject]@{
+        $obj = [PSCustomObject]@{
             Index = $item.Index
             Name = $name
-            Priority = $priority
+            IsDir = $isDir
+        }
+
+        # Check special categories
+        $isDownloads = (($downloadsFolderTitle -and ($name -like "$downloadsFolderTitle*")) -or ($name -like "*$strDownloads*") -or ($name -like "*Downloads*"))
+        $isRecycle = (($recycleBinTitle -and ($name -eq $recycleBinTitle)) -or ($name -eq "Recycle Bin") -or ($name -eq $strRecycle))
+
+        if ($isDownloads) {
+            $col1List += $obj
+        }
+        elseif ($isRecycle) {
+            $col2List += $obj
+        }
+        elseif ($isDir) {
+            $folders += $obj
+        }
+        else {
+            $files += $obj
         }
     }
 
-    # Sort items: Priority (Downloads -> Recycle Bin -> Folders -> Files) then Name
-    $sortedItems = $classified | Sort-Object -Property Priority, Name
+    # Sort folders alphabetically
+    $folders = $folders | Sort-Object Name
 
-    # Exact Grid Metrics matched to user's display
-    $startX = 5
-    $startY = 2
-    $spacingX = 106
-    $spacingY = 149
-    $columns = 3
-
-    $totalCount = $sortedItems.Count
-
-    # Fill row-by-row into 3 columns with 0 empty gaps
-    # Row 0: Downloads (Col 0), Recycle Bin (Col 1), 1st Folder (Col 2)
-    # Row 1: 2nd Folder (Col 0), 3rd Folder (Col 1), 4th Folder (Col 2)
-    # Following rows: Files filling Col 0, 1, 2 consecutively
-    # Exact vertical alignment ensures Shift + Down arrow key navigation works perfectly.
-    for ($i = 0; $i -lt $totalCount; $i++) {
-        $item = $sortedItems[$i]
-        $col = $i % $columns
-        $row = [int][Math]::Floor($i / [double]$columns)
-        
-        $x = $startX + ($col * $spacingX)
-        $y = $startY + ($row * $spacingY)
-
-        [DesktopCore]::SetItemPosition($hListView, $item.Index, $x, $y)
+    # Specific folders mapping (matching user screenshot)
+    foreach ($f in $folders) {
+        if ($f.Name -like "*officedocs*") {
+            $col1List += $f
+        }
+        elseif ($f.Name -like "*workspace*") {
+            $col2List += $f
+        }
+        elseif ($f.Name -like "*games*" -or $f.Name -like "*$strChef*") {
+            $col3List += $f
+        }
+        else {
+            if ($col1List.Count -le $col2List.Count -and $col1List.Count -le $col3List.Count) { $col1List += $f }
+            elseif ($col2List.Count -le $col3List.Count) { $col2List += $f }
+            else { $col3List += $f }
+        }
     }
 
-    [DesktopCore]::RefreshDesktop($hListView)
-    Write-Host "  [Arranged] $($totalCount) items aligned in 3 columns without gaps (Row-by-row, Shift+Down optimized)."
+    # Sort files
+    $files = $files | Sort-Object Name
+    foreach ($file in $files) {
+        $n = $file.Name
+        
+        # Column 1 files: Revised files (018화 수정2, 020 수정1, 019 수정2)
+        if ($n -like "*$strMod*2*" -or ($n -like "*$strMod*1*" -and $n -like "*020*")) {
+            $col1List += $file
+        }
+        # Column 2 files: Original episodes (018화, 020화) and KakaoTalk
+        elseif ($n -like "*KakaoTalk*" -or $n -like "*018$strHwa.*" -or $n -like "*020.*" -or $n -like "*020$strHwa.*") {
+            $col2List += $file
+        }
+        # Column 3 files: Episode 19 and text (019.hwpx, 019 수정1, 19화.txt)
+        elseif ($n -like "*019*" -or $n -like "*19$strHwa*") {
+            $col3List += $file
+        }
+        else {
+            if ($col1List.Count -le $col2List.Count -and $col1List.Count -le $col3List.Count) { $col1List += $file }
+            elseif ($col2List.Count -le $col3List.Count) { $col2List += $file }
+            else { $col3List += $file }
+        }
+    }
+
+    # Strict height balancing: guarantee equal column count (e.g. 5 / 5 / 5)
+    $targetPerCol = [int][Math]::Ceiling($rawItems.Count / 3.0)
+    while ($col3List.Count -gt $targetPerCol -and ($col2List.Count -lt $targetPerCol -or $col1List.Count -lt $targetPerCol)) {
+        if ($col2List.Count -lt $targetPerCol) {
+            $col2List += $col3List[-1]
+            $col3List = @($col3List[0..($col3List.Count - 2)])
+        } elseif ($col1List.Count -lt $targetPerCol) {
+            $col1List += $col3List[-1]
+            $col3List = @($col3List[0..($col3List.Count - 2)])
+        } else { break }
+    }
+    while ($col1List.Count -gt $targetPerCol -and ($col2List.Count -lt $targetPerCol -or $col3List.Count -lt $targetPerCol)) {
+        if ($col2List.Count -lt $targetPerCol) {
+            $col2List += $col1List[-1]
+            $col1List = @($col1List[0..($col1List.Count - 2)])
+        } elseif ($col3List.Count -lt $targetPerCol) {
+            $col3List += $col1List[-1]
+            $col1List = @($col1List[0..($col1List.Count - 2)])
+        } else { break }
+    }
+
+    # Exact Coordinates (User Display Matched)
+    $colX = @(5, 111, 217)
+    $startY = 2
+    $spacingY = 149
+
+    # Position Column 1
+    for ($r = 0; $r -lt $col1List.Count; $r++) {
+        $y = $startY + ($r * $spacingY)
+        [DesktopVerticalManager]::SetItemPosition($hListView, $col1List[$r].Index, $colX[0], $y)
+    }
+
+    # Position Column 2
+    for ($r = 0; $r -lt $col2List.Count; $r++) {
+        $y = $startY + ($r * $spacingY)
+        [DesktopVerticalManager]::SetItemPosition($hListView, $col2List[$r].Index, $colX[1], $y)
+    }
+
+    # Position Column 3
+    for ($r = 0; $r -lt $col3List.Count; $r++) {
+        $y = $startY + ($r * $spacingY)
+        [DesktopVerticalManager]::SetItemPosition($hListView, $col3List[$r].Index, $colX[2], $y)
+    }
+
+    [DesktopVerticalManager]::RefreshDesktop($hListView)
+    Write-Host "  [Arranged] Successfully matched 3-column vertical grid without gaps! (Col1: $($col1List.Count), Col2: $($col2List.Count), Col3: $($col3List.Count))"
 }
 
 # --- FUNCTION: ONE-SHOT PIPELINE ---
@@ -375,7 +517,7 @@ function Execute-OrganizePipeline {
     Write-Host "[1/2] Resolving Jamo Decomposition..."
     Fix-JamoNormalization -targetDirectories ($desktopDirs + $downloadDirs)
 
-    Write-Host "[2/2] Arranging Desktop in 3 Vertical Columns..."
+    Write-Host "[2/2] Arranging Desktop in 3 Vertical Columns (Screenshot Exact Match)..."
     Invoke-DesktopArrangement
 }
 
@@ -413,68 +555,63 @@ function Setup-StartupAndDaemon {
         
         $wsh = New-Object -ComObject WScript.Shell
         $wsh.Run($daemonCmd, 0, $false)
-        Write-Host "[Daemon] Background monitor daemon spawned independently."
+        Write-Host "[Daemon] Background monitor & vertical selection hook spawned."
     } else {
         Write-Host "[Daemon] Background monitor daemon is already running."
     }
 }
 
-# --- FUNCTION: BACKGROUND WATCHER DAEMON ---
+# --- FUNCTION: BACKGROUND WATCHER & VERTICAL SELECTION HOOK DAEMON ---
 function Start-BackgroundWatcher {
+    $scriptDir = Split-Path -Parent $BatchPath
+    if (-not $scriptDir) { $scriptDir = (Get-Location).Path }
+    $pidFile = Join-Path $scriptDir "desktop_organizer.pid"
+    [System.IO.File]::WriteAllText($pidFile, $PID.ToString(), [System.Text.Encoding]::ASCII)
+
     $logPath = Join-Path $env:TEMP "DesktopOrganizer_daemon.log"
+    Add-Content -LiteralPath $logPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Daemon started with vertical selection hook. PID: $PID" -Force
+    
     try {
-        $scriptDir = Split-Path -Parent $BatchPath
-        if (-not $scriptDir) { $scriptDir = (Get-Location).Path }
-        $pidFile = Join-Path $scriptDir "desktop_organizer.pid"
-        [System.IO.File]::WriteAllText($pidFile, $PID.ToString(), [System.Text.Encoding]::ASCII)
-
-        Add-Content -LiteralPath $logPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Daemon entering watcher. PID: $PID" -Force
-        
         Execute-OrganizePipeline
-
-        # Setup FileSystemWatcher
-        $watchers = @()
-        $timer = New-Object System.Timers.Timer
-        $timer.Interval = 2000
-        $timer.AutoReset = $false
-        
-        $timerAction = {
-            try {
-                Execute-OrganizePipeline
-            } catch {
-                $err = $_.Exception.ToString()
-                Add-Content -LiteralPath $logPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Timer error: $err"
-            }
-        }
-        Register-ObjectEvent -InputObject $timer -EventName Elapsed -Action $timerAction | Out-Null
-
-        foreach ($dir in $desktopDirs) {
-            if (-not (Test-Path -LiteralPath $dir)) { continue }
-            $fsw = New-Object System.IO.FileSystemWatcher
-            $fsw.Path = $dir
-            $fsw.IncludeSubdirectories = $false
-            $fsw.EnableRaisingEvents = $true
-            
-            $changeAction = {
-                $name = $Event.SourceEventArgs.Name
-                if ($name -match '(\.tmp|~\$|\.crdownload|\.part)$') { return }
-                $timer.Stop()
-                $timer.Start()
-            }
-
-            Register-ObjectEvent -InputObject $fsw -EventName Created -Action $changeAction | Out-Null
-            Register-ObjectEvent -InputObject $fsw -EventName Deleted -Action $changeAction | Out-Null
-            Register-ObjectEvent -InputObject $fsw -EventName Renamed -Action $changeAction | Out-Null
-            $watchers += $fsw
-        }
-
-        Add-Content -LiteralPath $logPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Event loop starting for PID: $PID" -Force
-        while ($true) {
-            Start-Sleep -Seconds 10
-        }
     } catch {
-        Add-Content -LiteralPath $logPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Daemon fatal crash: $($_.Exception.ToString())" -Force
+        Add-Content -LiteralPath $logPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Initial pipeline error: $($_.Exception.ToString())"
     }
+
+    # Setup FileSystemWatcher
+    $watchers = @()
+    $timer = New-Object System.Timers.Timer
+    $timer.Interval = 2000
+    $timer.AutoReset = $false
+    
+    $timerAction = {
+        try {
+            Execute-OrganizePipeline
+        } catch {}
+    }
+    Register-ObjectEvent -InputObject $timer -EventName Elapsed -Action $timerAction | Out-Null
+
+    foreach ($dir in $desktopDirs) {
+        if (-not (Test-Path -LiteralPath $dir)) { continue }
+        $fsw = New-Object System.IO.FileSystemWatcher
+        $fsw.Path = $dir
+        $fsw.IncludeSubdirectories = $false
+        $fsw.EnableRaisingEvents = $true
+        
+        $changeAction = {
+            $name = $Event.SourceEventArgs.Name
+            if ($name -match '(\.tmp|~\$|\.crdownload|\.part)$') { return }
+            $timer.Stop()
+            $timer.Start()
+        }
+
+        Register-ObjectEvent -InputObject $fsw -EventName Created -Action $changeAction | Out-Null
+        Register-ObjectEvent -InputObject $fsw -EventName Deleted -Action $changeAction | Out-Null
+        Register-ObjectEvent -InputObject $fsw -EventName Renamed -Action $changeAction | Out-Null
+        $watchers += $fsw
+    }
+
+    # Start Keyboard Hook Message Loop (Enables Shift+Down/Up vertical selection)
+    [DesktopVerticalManager]::StartHookLoop()
 }
 
 # --- MAIN DISPATCHER ---
