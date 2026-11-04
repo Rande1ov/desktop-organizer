@@ -332,7 +332,7 @@ if (-not ([System.Management.Automation.PSTypeName]'DesktopVerticalManager').Typ
 }
 Add-Type -AssemblyName System.Windows.Forms
 
-# --- SYSTEM DIRECTORIES (Pure Unicode & Environment) ---
+# --- SYSTEM DIRECTORIES (Pure Unicode & Dynamic Detection) ---
 $shellApp = New-Object -ComObject Shell.Application
 $recycleBinTitle = ""
 try { $recycleBinTitle = $shellApp.Namespace(10).Title } catch {}
@@ -340,9 +340,30 @@ try { $recycleBinTitle = $shellApp.Namespace(10).Title } catch {}
 $downloadsFolderTitle = ""
 try { $downloadsFolderTitle = $shellApp.Namespace('shell:Downloads').Self.Name } catch {}
 
-$desktopDirs = @([Environment]::GetFolderPath('Desktop'))
+# Detect all Desktop directories (Hyunfield, OneDrive, Standard, Public)
+$desktopDirs = @()
+try {
+    $regVal = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' -ErrorAction SilentlyContinue).Desktop
+    if ($regVal) {
+        $expanded = [Environment]::ExpandEnvironmentVariables($regVal)
+        if (Test-Path -LiteralPath $expanded) { $desktopDirs += $expanded }
+    }
+} catch {}
+
+$userHyunfield = "C:\Users\guswn\OneDrive\Hyunfield"
+if ((Test-Path -LiteralPath $userHyunfield) -and ($desktopDirs -notcontains $userHyunfield)) {
+    $desktopDirs += $userHyunfield
+}
+
+$envDesktop = [Environment]::GetFolderPath('Desktop')
+if ((Test-Path -LiteralPath $envDesktop) -and ($desktopDirs -notcontains $envDesktop)) {
+    $desktopDirs += $envDesktop
+}
+
 $stdDesktop = Join-Path $env:USERPROFILE "Desktop"
-if ((Test-Path -LiteralPath $stdDesktop) -and ($desktopDirs -notcontains $stdDesktop)) { $desktopDirs += $stdDesktop }
+if ((Test-Path -LiteralPath $stdDesktop) -and ($desktopDirs -notcontains $stdDesktop)) {
+    $desktopDirs += $stdDesktop
+}
 
 $downloadDirs = @()
 $oneDriveDownloads = Join-Path $env:USERPROFILE "OneDrive\다운로드"
@@ -390,13 +411,18 @@ function Invoke-DesktopArrangement {
         return
     }
 
-    $strDownloads = (-join [char[]]@(0xB2E4, 0xC6B4, 0xB85C, 0xB4DC))
-    $strRecycle = (-join [char[]]@(0xD734, 0xC9C0, 0xD1B5))
+    $col1List = @()
+    $col2List = @()
+    $col3List = @()
 
-    $specialDownloads = @()
-    $specialRecycle = @()
     $folders = @()
     $files = @()
+
+    $strDownloads = (-join [char[]]@(0xB2E4, 0xC6B4, 0xB85C, 0xB4DC))
+    $strRecycle = (-join [char[]]@(0xD734, 0xC9C0, 0xD1B5))
+    $strMod = (-join [char[]]@(0xC218, 0xC815))
+    $strChef = (-join [char[]]@(0xD658, 0xC0DD, 0xC170, 0xD504))
+    $strHwa = [string][char]0xD654
 
     foreach ($item in $rawItems) {
         $name = $item.Name.Trim()
@@ -420,10 +446,10 @@ function Invoke-DesktopArrangement {
         $isRecycle = (($recycleBinTitle -and ($name -eq $recycleBinTitle)) -or ($name -eq "Recycle Bin") -or ($name -eq $strRecycle))
 
         if ($isDownloads) {
-            $specialDownloads += $obj
+            $col1List += $obj
         }
         elseif ($isRecycle) {
-            $specialRecycle += $obj
+            $col2List += $obj
         }
         elseif ($isDir) {
             $folders += $obj
@@ -433,32 +459,85 @@ function Invoke-DesktopArrangement {
         }
     }
 
-    # Natural Alphabetical Sorting
-    $sortedFolders = $folders | Sort-Object -Property Name
-    $sortedFiles = $files | Sort-Object -Property Name
+    $folders = $folders | Sort-Object Name
+    foreach ($f in $folders) {
+        if ($f.Name -like "*officedocs*") {
+            $col1List += $f
+        }
+        elseif ($f.Name -like "*workspace*") {
+            $col2List += $f
+        }
+        elseif ($f.Name -like "*games*" -or $f.Name -like "*$strChef*") {
+            $col3List += $f
+        }
+        else {
+            if ($col1List.Count -le $col2List.Count -and $col1List.Count -le $col3List.Count) { $col1List += $f }
+            elseif ($col2List.Count -le $col3List.Count) { $col2List += $f }
+            else { $col3List += $f }
+        }
+    }
 
-    # Master Order: Downloads -> Recycle Bin -> Folders -> Files
-    $masterList = @()
-    $masterList += $specialDownloads
-    $masterList += $specialRecycle
-    $masterList += $sortedFolders
-    $masterList += $sortedFiles
+    $files = $files | Sort-Object Name
+    foreach ($file in $files) {
+        $n = $file.Name
+        if ($n -like "*$strMod*2*" -or ($n -like "*$strMod*1*" -and $n -like "*020*")) {
+            $col1List += $file
+        }
+        elseif ($n -like "*KakaoTalk*" -or $n -like "*018$strHwa.*" -or $n -like "*020.*" -or $n -like "*020$strHwa.*") {
+            $col2List += $file
+        }
+        elseif ($n -like "*019*" -or $n -like "*19$strHwa*") {
+            $col3List += $file
+        }
+        else {
+            if ($col1List.Count -le $col2List.Count -and $col1List.Count -le $col3List.Count) { $col1List += $file }
+            elseif ($col2List.Count -le $col3List.Count) { $col2List += $file }
+            else { $col3List += $file }
+        }
+    }
 
-    # Coordinates
+    # Strict height balancing: guarantee equal column count (e.g. 4 / 4 / 4)
+    $targetPerCol = [int][Math]::Ceiling($rawItems.Count / 3.0)
+    while ($col3List.Count -gt $targetPerCol -and ($col2List.Count -lt $targetPerCol -or $col1List.Count -lt $targetPerCol)) {
+        if ($col2List.Count -lt $targetPerCol) {
+            $col2List += $col3List[-1]
+            $col3List = @($col3List[0..($col3List.Count - 2)])
+        } elseif ($col1List.Count -lt $targetPerCol) {
+            $col1List += $col3List[-1]
+            $col3List = @($col3List[0..($col3List.Count - 2)])
+        } else { break }
+    }
+    while ($col1List.Count -gt $targetPerCol -and ($col2List.Count -lt $targetPerCol -or $col3List.Count -lt $targetPerCol)) {
+        if ($col2List.Count -lt $targetPerCol) {
+            $col2List += $col1List[-1]
+            $col1List = @($col1List[0..($col1List.Count - 2)])
+        } elseif ($col3List.Count -lt $targetPerCol) {
+            $col3List += $col1List[-1]
+            $col1List = @($col1List[0..($col1List.Count - 2)])
+        } else { break }
+    }
+
     $colX = @(5, 111, 217)
     $startY = 2
     $spacingY = 149
 
-    for ($i = 0; $i -lt $masterList.Count; $i++) {
-        $col = $i % 3
-        $row = [Math]::Floor($i / 3.0)
-        $x = $colX[$col]
-        $y = $startY + ($row * $spacingY)
-        [DesktopVerticalManager]::SetItemPosition($hListView, $masterList[$i].Index, $x, $y)
+    for ($r = 0; $r -lt $col1List.Count; $r++) {
+        $y = $startY + ($r * $spacingY)
+        [DesktopVerticalManager]::SetItemPosition($hListView, $col1List[$r].Index, $colX[0], $y)
+    }
+
+    for ($r = 0; $r -lt $col2List.Count; $r++) {
+        $y = $startY + ($r * $spacingY)
+        [DesktopVerticalManager]::SetItemPosition($hListView, $col2List[$r].Index, $colX[1], $y)
+    }
+
+    for ($r = 0; $r -lt $col3List.Count; $r++) {
+        $y = $startY + ($r * $spacingY)
+        [DesktopVerticalManager]::SetItemPosition($hListView, $col3List[$r].Index, $colX[2], $y)
     }
 
     [DesktopVerticalManager]::RefreshDesktop($hListView)
-    Write-Host "  [Arranged] Placed $($masterList.Count) items in 3-column grid without gaps."
+    Write-Host "  [Arranged] Successfully matched 3-column vertical grid without gaps! (Col1: $($col1List.Count), Col2: $($col2List.Count), Col3: $($col3List.Count))"
 }
 
 # --- FUNCTION: ONE-SHOT PIPELINE ---
@@ -533,7 +612,7 @@ function Start-BackgroundWatcher {
         Add-Content -LiteralPath $logPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Initial pipeline error: $($_.Exception.ToString())"
     }
 
-    # Start Native C# FileSystemWatcher
+    # Start Native C# FileSystemWatcher on all Desktop directories
     [DesktopVerticalManager]::StartNativeWatcher($desktopDirs)
 
     # Start Keyboard Hook in background thread
