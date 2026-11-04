@@ -91,8 +91,11 @@ public class DesktopVerticalManager {
 
     private const int WH_KEYBOARD_LL = 13;
     private const int WM_KEYDOWN = 0x0100;
+    private const int WM_KEYUP = 0x0101;
     private const int VK_SHIFT = 0x10;
+    private const int VK_LEFT = 0x25;
     private const int VK_UP = 0x26;
+    private const int VK_RIGHT = 0x27;
     private const int VK_DOWN = 0x28;
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -107,9 +110,16 @@ public class DesktopVerticalManager {
         public string Name;
     }
 
+    public class PosItem {
+        public int Index;
+        public int X;
+        public int Y;
+    }
+
     private static IntPtr _hookId = IntPtr.Zero;
     private static LowLevelKeyboardProc _proc = HookCallback;
     private static Thread _hookThread = null;
+    private static int _anchorIndex = -1;
 
     // Native Watcher variables (Thread-safe flag)
     public static volatile bool NeedsArrange = false;
@@ -140,13 +150,36 @@ public class DesktopVerticalManager {
         return hDefView != IntPtr.Zero;
     }
 
+    private static void SetItemStateSafely(IntPtr hProc, IntPtr hList, int itemIndex, uint state, uint stateMask) {
+        IntPtr pMem = VirtualAllocEx(hProc, IntPtr.Zero, (uint)Marshal.SizeOf(typeof(LVITEM)), 0x1000, 0x04);
+        if (pMem == IntPtr.Zero) return;
+        LVITEM lv = new LVITEM();
+        lv.stateMask = stateMask;
+        lv.state = state;
+        IntPtr written;
+        WriteProcessMemory(hProc, pMem, ref lv, (uint)Marshal.SizeOf(typeof(LVITEM)), out written);
+        SendMessage(hList, LVM_SETITEMSTATE, (IntPtr)itemIndex, pMem);
+        VirtualFreeEx(hProc, pMem, 0, 0x8000);
+    }
+
     private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam) {
-        if (nCode >= 0 && wParam == (IntPtr)WM_KEYDOWN) {
+        if (nCode >= 0) {
             int vkCode = Marshal.ReadInt32(lParam);
-            if ((vkCode == VK_DOWN || vkCode == VK_UP) && (GetAsyncKeyState(VK_SHIFT) < 0)) {
-                if (IsDesktopForeground()) {
-                    if (HandleVerticalSelection(vkCode == VK_DOWN)) {
-                        return (IntPtr)1; // Suppress default horizontal row selection!
+            if (wParam == (IntPtr)WM_KEYUP && (vkCode == VK_SHIFT || vkCode == 0xA0 || vkCode == 0xA1)) {
+                _anchorIndex = -1;
+            } else if (wParam == (IntPtr)WM_KEYDOWN) {
+                bool isShift = (GetAsyncKeyState(VK_SHIFT) < 0);
+                if (!isShift) {
+                    _anchorIndex = -1;
+                } else if (IsDesktopForeground()) {
+                    if (vkCode == VK_DOWN || vkCode == VK_UP) {
+                        if (HandleVerticalSelection(vkCode == VK_DOWN)) {
+                            return (IntPtr)1; // Suppress default horizontal selection
+                        }
+                    } else if (vkCode == VK_RIGHT || vkCode == VK_LEFT) {
+                        if (HandleHorizontalSelection(vkCode == VK_RIGHT)) {
+                            return (IntPtr)1; // Suppress default selection
+                        }
                     }
                 }
             }
@@ -176,42 +209,164 @@ public class DesktopVerticalManager {
         int curX = BitConverter.ToInt32(ptb, 0);
         int curY = BitConverter.ToInt32(ptb, 4);
 
-        int bestIndex = -1;
-        int bestDist = int.MaxValue;
-
+        List<PosItem> colItems = new List<PosItem>();
         for (int i = 0; i < count; i++) {
-            if (i == focused) continue;
             SendMessage(hList, LVM_GETITEMPOSITION, (IntPtr)i, pPoint);
             ReadProcessMemory(hProc, pPoint, ptb, (uint)ptb.Length, out read);
             int x = BitConverter.ToInt32(ptb, 0);
             int y = BitConverter.ToInt32(ptb, 4);
-
             if (Math.Abs(x - curX) <= 35) {
-                if (isDown && y > curY) {
-                    int dist = y - curY;
-                    if (dist < bestDist) { bestDist = dist; bestIndex = i; }
-                } else if (!isDown && y < curY) {
-                    int dist = curY - y;
-                    if (dist < bestDist) { bestDist = dist; bestIndex = i; }
-                }
+                colItems.Add(new PosItem { Index = i, X = x, Y = y });
+            }
+        }
+        VirtualFreeEx(hProc, pPoint, 0, 0x8000);
+
+        if (colItems.Count <= 1) {
+            CloseHandle(hProc);
+            return false;
+        }
+
+        colItems.Sort((a, b) => a.Y.CompareTo(b.Y));
+
+        int curPos = -1;
+        int anchorPos = -1;
+        for (int i = 0; i < colItems.Count; i++) {
+            if (colItems[i].Index == focused) curPos = i;
+            if (colItems[i].Index == _anchorIndex) anchorPos = i;
+        }
+
+        if (curPos < 0) {
+            CloseHandle(hProc);
+            return false;
+        }
+
+        if (anchorPos < 0) {
+            _anchorIndex = focused;
+            anchorPos = curPos;
+        }
+
+        int targetPos = isDown ? (curPos + 1) : (curPos - 1);
+        if (targetPos < 0 || targetPos >= colItems.Count) {
+            CloseHandle(hProc);
+            return true; // Reached column boundary
+        }
+
+        int minP = Math.Min(anchorPos, targetPos);
+        int maxP = Math.Max(anchorPos, targetPos);
+        int oldMinP = Math.Min(anchorPos, curPos);
+        int oldMaxP = Math.Max(anchorPos, curPos);
+
+        // Deselect items that left the range
+        for (int p = oldMinP; p <= oldMaxP; p++) {
+            if (p < minP || p > maxP) {
+                SetItemStateSafely(hProc, hList, colItems[p].Index, 0, (uint)LVIS_SELECTED);
             }
         }
 
-        VirtualFreeEx(hProc, pPoint, 0, 0x8000);
-        CloseHandle(hProc);
-
-        if (bestIndex != -1) {
-            LVITEM lv = new LVITEM();
-            lv.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
-            lv.state = LVIS_SELECTED | LVIS_FOCUSED;
-            IntPtr pLv = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(LVITEM)));
-            Marshal.StructureToPtr(lv, pLv, false);
-            SendMessage(hList, LVM_SETITEMSTATE, (IntPtr)bestIndex, pLv);
-            Marshal.FreeHGlobal(pLv);
-            return true;
+        // Select items in new range & focus target
+        for (int p = minP; p <= maxP; p++) {
+            uint state = (uint)LVIS_SELECTED;
+            uint mask = (uint)LVIS_SELECTED;
+            if (p == targetPos) {
+                state |= (uint)LVIS_FOCUSED;
+                mask |= (uint)LVIS_FOCUSED;
+            }
+            SetItemStateSafely(hProc, hList, colItems[p].Index, state, mask);
         }
 
-        return false;
+        CloseHandle(hProc);
+        return true;
+    }
+
+    private static bool HandleHorizontalSelection(bool isRight) {
+        IntPtr hList = FindListView();
+        if (hList == IntPtr.Zero) return false;
+
+        int count = (int)SendMessage(hList, LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero);
+        int focused = (int)SendMessage(hList, LVM_GETNEXTITEM, (IntPtr)(-1), (IntPtr)LVNI_FOCUSED);
+        if (focused < 0) return false;
+
+        uint pid;
+        GetWindowThreadProcessId(hList, out pid);
+        IntPtr hProc = OpenProcess(0x0038, false, pid);
+        if (hProc == IntPtr.Zero) return false;
+
+        IntPtr pPoint = VirtualAllocEx(hProc, IntPtr.Zero, (uint)Marshal.SizeOf(typeof(POINT)), 0x1000, 0x04);
+        byte[] ptb = new byte[Marshal.SizeOf(typeof(POINT))];
+        IntPtr read;
+
+        List<PosItem> allItems = new List<PosItem>();
+        for (int i = 0; i < count; i++) {
+            SendMessage(hList, LVM_GETITEMPOSITION, (IntPtr)i, pPoint);
+            ReadProcessMemory(hProc, pPoint, ptb, (uint)ptb.Length, out read);
+            int x = BitConverter.ToInt32(ptb, 0);
+            int y = BitConverter.ToInt32(ptb, 4);
+            allItems.Add(new PosItem { Index = i, X = x, Y = y });
+        }
+        VirtualFreeEx(hProc, pPoint, 0, 0x8000);
+
+        if (allItems.Count <= 1) {
+            CloseHandle(hProc);
+            return false;
+        }
+
+        // Sort items in row-major order: Row 0 (Col 0, 1, 2), Row 1 (Col 0, 1, 2), ...
+        // Using Y/80 to group into rows (spacing is ~149px)
+        allItems.Sort((a, b) => {
+            int rowA = a.Y / 80;
+            int rowB = b.Y / 80;
+            if (rowA != rowB) return rowA.CompareTo(rowB);
+            return a.X.CompareTo(b.X);
+        });
+
+        int curPos = -1;
+        int anchorPos = -1;
+        for (int i = 0; i < allItems.Count; i++) {
+            if (allItems[i].Index == focused) curPos = i;
+            if (allItems[i].Index == _anchorIndex) anchorPos = i;
+        }
+
+        if (curPos < 0) {
+            CloseHandle(hProc);
+            return false;
+        }
+
+        if (anchorPos < 0) {
+            _anchorIndex = focused;
+            anchorPos = curPos;
+        }
+
+        int targetPos = isRight ? (curPos + 1) : (curPos - 1);
+        if (targetPos < 0 || targetPos >= allItems.Count) {
+            CloseHandle(hProc);
+            return true; // Reached boundary
+        }
+
+        int minP = Math.Min(anchorPos, targetPos);
+        int maxP = Math.Max(anchorPos, targetPos);
+        int oldMinP = Math.Min(anchorPos, curPos);
+        int oldMaxP = Math.Max(anchorPos, curPos);
+
+        // Deselect items that left the range
+        for (int p = oldMinP; p <= oldMaxP; p++) {
+            if (p < minP || p > maxP) {
+                SetItemStateSafely(hProc, hList, allItems[p].Index, 0, (uint)LVIS_SELECTED);
+            }
+        }
+
+        // Select items in new range & focus target
+        for (int p = minP; p <= maxP; p++) {
+            uint state = (uint)LVIS_SELECTED;
+            uint mask = (uint)LVIS_SELECTED;
+            if (p == targetPos) {
+                state |= (uint)LVIS_FOCUSED;
+                mask |= (uint)LVIS_FOCUSED;
+            }
+            SetItemStateSafely(hProc, hList, allItems[p].Index, state, mask);
+        }
+
+        CloseHandle(hProc);
+        return true;
     }
 
     public static void StartHookThread() {
