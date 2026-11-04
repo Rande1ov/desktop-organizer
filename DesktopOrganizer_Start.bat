@@ -28,11 +28,12 @@ param(
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-# --- WIN32 / C# VERTICAL MANAGER & KEYBOARD HOOK DEFINITION ---
+# --- WIN32 / C# VERTICAL MANAGER & NATIVE WATCHER & KEYBOARD HOOK ---
 $cSharpCode = @'
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -81,7 +82,6 @@ public class DesktopVerticalManager {
     public const int LVIS_FOCUSED = 0x0001;
     public const int LVIS_SELECTED = 0x0002;
     public const int LVNI_FOCUSED = 0x0001;
-    public const int LVNI_SELECTED = 0x0002;
 
     public const int GWL_STYLE = -16;
     public const int LVS_AUTOARRANGE = 0x0100;
@@ -99,12 +99,8 @@ public class DesktopVerticalManager {
     public struct LVITEM {
         public uint mask; public int iItem; public int iSubItem; public uint state; public uint stateMask; public IntPtr pszText; public int cchTextMax; public int iImage; public IntPtr lParam; public int iIndent; public int iGroupId; public uint cColumns; public IntPtr puColumns; public IntPtr piColFmt; public int iGroup;
     }
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct POINT { public int x; public int y; }
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public POINT pt; }
+    [StructLayout(LayoutKind.Sequential)] public struct POINT { public int x; public int y; }
+    [StructLayout(LayoutKind.Sequential)] public struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public POINT pt; }
 
     public class ItemEntry {
         public int Index;
@@ -113,6 +109,12 @@ public class DesktopVerticalManager {
 
     private static IntPtr _hookId = IntPtr.Zero;
     private static LowLevelKeyboardProc _proc = HookCallback;
+    private static Thread _hookThread = null;
+
+    // Native Watcher variables (Thread-safe flag)
+    public static volatile bool NeedsArrange = false;
+    private static List<FileSystemWatcher> _watchers = new List<FileSystemWatcher>();
+    private static System.Threading.Timer _debounceTimer = null;
 
     public static IntPtr FindListView() {
         IntPtr hProgman = FindWindow("Progman", null);
@@ -134,7 +136,6 @@ public class DesktopVerticalManager {
         GetClassName(hFore, sb, 256);
         string cls = sb.ToString();
         if (cls == "Progman" || cls == "WorkerW" || cls == "SHELLDLL_DefView" || cls == "SysListView32") return true;
-
         IntPtr hDefView = FindWindowEx(hFore, IntPtr.Zero, "SHELLDLL_DefView", null);
         return hDefView != IntPtr.Zero;
     }
@@ -170,7 +171,6 @@ public class DesktopVerticalManager {
         byte[] ptb = new byte[Marshal.SizeOf(typeof(POINT))];
         IntPtr read;
 
-        // Current item position
         SendMessage(hList, LVM_GETITEMPOSITION, (IntPtr)focused, pPoint);
         ReadProcessMemory(hProc, pPoint, ptb, (uint)ptb.Length, out read);
         int curX = BitConverter.ToInt32(ptb, 0);
@@ -186,20 +186,13 @@ public class DesktopVerticalManager {
             int x = BitConverter.ToInt32(ptb, 0);
             int y = BitConverter.ToInt32(ptb, 4);
 
-            // Same column (X within 30px)
-            if (Math.Abs(x - curX) <= 30) {
+            if (Math.Abs(x - curX) <= 35) {
                 if (isDown && y > curY) {
                     int dist = y - curY;
-                    if (dist < bestDist) {
-                        bestDist = dist;
-                        bestIndex = i;
-                    }
+                    if (dist < bestDist) { bestDist = dist; bestIndex = i; }
                 } else if (!isDown && y < curY) {
                     int dist = curY - y;
-                    if (dist < bestDist) {
-                        bestDist = dist;
-                        bestIndex = i;
-                    }
+                    if (dist < bestDist) { bestDist = dist; bestIndex = i; }
                 }
             }
         }
@@ -208,7 +201,6 @@ public class DesktopVerticalManager {
         CloseHandle(hProc);
 
         if (bestIndex != -1) {
-            // Select and focus next vertical item in same column
             LVITEM lv = new LVITEM();
             lv.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
             lv.state = LVIS_SELECTED | LVIS_FOCUSED;
@@ -222,21 +214,54 @@ public class DesktopVerticalManager {
         return false;
     }
 
-    public static void StartHookLoop() {
-        using (Process curProcess = Process.GetCurrentProcess())
-        using (ProcessModule curModule = curProcess.MainModule) {
-            _hookId = SetWindowsHookEx(WH_KEYBOARD_LL, _proc, GetModuleHandle(curModule.ModuleName), 0);
-        }
+    public static void StartHookThread() {
+        if (_hookThread != null && _hookThread.IsAlive) return;
+        _hookThread = new Thread(() => {
+            using (Process curProcess = Process.GetCurrentProcess())
+            using (ProcessModule curModule = curProcess.MainModule) {
+                _hookId = SetWindowsHookEx(WH_KEYBOARD_LL, _proc, GetModuleHandle(curModule.ModuleName), 0);
+            }
+            MSG msg;
+            while (GetMessage(out msg, IntPtr.Zero, 0, 0) > 0) {
+                TranslateMessage(ref msg);
+                DispatchMessage(ref msg);
+            }
+            if (_hookId != IntPtr.Zero) {
+                UnhookWindowsHookEx(_hookId);
+                _hookId = IntPtr.Zero;
+            }
+        });
+        _hookThread.IsBackground = true;
+        _hookThread.Start();
+    }
 
-        MSG msg;
-        while (GetMessage(out msg, IntPtr.Zero, 0, 0) > 0) {
-            TranslateMessage(ref msg);
-            DispatchMessage(ref msg);
-        }
+    public static void StartNativeWatcher(string[] paths) {
+        _debounceTimer = new System.Threading.Timer((state) => {
+            NeedsArrange = true;
+        }, null, Timeout.Infinite, Timeout.Infinite);
 
-        if (_hookId != IntPtr.Zero) {
-            UnhookWindowsHookEx(_hookId);
-            _hookId = IntPtr.Zero;
+        foreach (string path in paths) {
+            if (!Directory.Exists(path)) continue;
+            try {
+                FileSystemWatcher fsw = new FileSystemWatcher(path);
+                fsw.NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.Size | NotifyFilters.LastWrite;
+                fsw.IncludeSubdirectories = false;
+                
+                FileSystemEventHandler changeHandler = (s, e) => {
+                    if (e.Name.EndsWith(".tmp") || e.Name.StartsWith("~$")) return;
+                    _debounceTimer.Change(800, Timeout.Infinite); // 800ms debounce
+                };
+
+                fsw.Created += changeHandler;
+                fsw.Deleted += changeHandler;
+                fsw.Renamed += (s, e) => {
+                    if (e.Name.EndsWith(".tmp") || e.Name.StartsWith("~$")) return;
+                    _debounceTimer.Change(800, Timeout.Infinite);
+                };
+
+                fsw.EnableRaisingEvents = true;
+                _watchers.Add(fsw);
+            } catch {}
         }
     }
 
@@ -307,7 +332,7 @@ if (-not ([System.Management.Automation.PSTypeName]'DesktopVerticalManager').Typ
 }
 Add-Type -AssemblyName System.Windows.Forms
 
-# --- SYSTEM KNOWN TITLES & PATHS ---
+# --- SYSTEM DIRECTORIES (Pure Unicode & Environment) ---
 $shellApp = New-Object -ComObject Shell.Application
 $recycleBinTitle = ""
 try { $recycleBinTitle = $shellApp.Namespace(10).Title } catch {}
@@ -315,10 +340,8 @@ try { $recycleBinTitle = $shellApp.Namespace(10).Title } catch {}
 $downloadsFolderTitle = ""
 try { $downloadsFolderTitle = $shellApp.Namespace('shell:Downloads').Self.Name } catch {}
 
-$desktopDirs = @()
-$oneDriveDesktop = Join-Path $env:USERPROFILE "OneDrive\바탕 화면"
-if (Test-Path -LiteralPath $oneDriveDesktop) { $desktopDirs += $oneDriveDesktop }
-$stdDesktop = [Environment]::GetFolderPath('Desktop')
+$desktopDirs = @([Environment]::GetFolderPath('Desktop'))
+$stdDesktop = Join-Path $env:USERPROFILE "Desktop"
 if ((Test-Path -LiteralPath $stdDesktop) -and ($desktopDirs -notcontains $stdDesktop)) { $desktopDirs += $stdDesktop }
 
 $downloadDirs = @()
@@ -358,7 +381,7 @@ function Fix-JamoNormalization {
     }
 }
 
-# --- FUNCTION: ARRANGE DESKTOP (EXACT 3-COLUMN IMAGE MATCH) ---
+# --- FUNCTION: ARRANGE DESKTOP (EXACT 3-COLUMN SEAMLESS MATCH) ---
 function Invoke-DesktopArrangement {
     $hListView = [IntPtr]::Zero
     $rawItems = [DesktopVerticalManager]::GetAllItems([ref]$hListView)
@@ -367,25 +390,17 @@ function Invoke-DesktopArrangement {
         return
     }
 
-    # Separate into Column 1, Column 2, Column 3 exactly as shown in user's image
-    $col1List = @()
-    $col2List = @()
-    $col3List = @()
-
-    $folders = @()
-    $files = @()
-
-    # Pure English Unicode strings for Korean titles
     $strDownloads = (-join [char[]]@(0xB2E4, 0xC6B4, 0xB85C, 0xB4DC))
     $strRecycle = (-join [char[]]@(0xD734, 0xC9C0, 0xD1B5))
-    $strMod = (-join [char[]]@(0xC218, 0xC815))
-    $strChef = (-join [char[]]@(0xD658, 0xC0DD, 0xC170, 0xD504))
-    $strHwa = [string][char]0xD654
+
+    $specialDownloads = @()
+    $specialRecycle = @()
+    $folders = @()
+    $files = @()
 
     foreach ($item in $rawItems) {
         $name = $item.Name.Trim()
         
-        # Check folder vs file
         $isDir = $false
         foreach ($d in $desktopDirs) {
             $checkPath = Join-Path $d $name
@@ -401,15 +416,14 @@ function Invoke-DesktopArrangement {
             IsDir = $isDir
         }
 
-        # Check special categories
         $isDownloads = (($downloadsFolderTitle -and ($name -like "$downloadsFolderTitle*")) -or ($name -like "*$strDownloads*") -or ($name -like "*Downloads*"))
         $isRecycle = (($recycleBinTitle -and ($name -eq $recycleBinTitle)) -or ($name -eq "Recycle Bin") -or ($name -eq $strRecycle))
 
         if ($isDownloads) {
-            $col1List += $obj
+            $specialDownloads += $obj
         }
         elseif ($isRecycle) {
-            $col2List += $obj
+            $specialRecycle += $obj
         }
         elseif ($isDir) {
             $folders += $obj
@@ -419,97 +433,32 @@ function Invoke-DesktopArrangement {
         }
     }
 
-    # Sort folders alphabetically
-    $folders = $folders | Sort-Object Name
+    # Natural Alphabetical Sorting
+    $sortedFolders = $folders | Sort-Object -Property Name
+    $sortedFiles = $files | Sort-Object -Property Name
 
-    # Specific folders mapping (matching user screenshot)
-    foreach ($f in $folders) {
-        if ($f.Name -like "*officedocs*") {
-            $col1List += $f
-        }
-        elseif ($f.Name -like "*workspace*") {
-            $col2List += $f
-        }
-        elseif ($f.Name -like "*games*" -or $f.Name -like "*$strChef*") {
-            $col3List += $f
-        }
-        else {
-            if ($col1List.Count -le $col2List.Count -and $col1List.Count -le $col3List.Count) { $col1List += $f }
-            elseif ($col2List.Count -le $col3List.Count) { $col2List += $f }
-            else { $col3List += $f }
-        }
-    }
+    # Master Order: Downloads -> Recycle Bin -> Folders -> Files
+    $masterList = @()
+    $masterList += $specialDownloads
+    $masterList += $specialRecycle
+    $masterList += $sortedFolders
+    $masterList += $sortedFiles
 
-    # Sort files
-    $files = $files | Sort-Object Name
-    foreach ($file in $files) {
-        $n = $file.Name
-        
-        # Column 1 files: Revised files (018화 수정2, 020 수정1, 019 수정2)
-        if ($n -like "*$strMod*2*" -or ($n -like "*$strMod*1*" -and $n -like "*020*")) {
-            $col1List += $file
-        }
-        # Column 2 files: Original episodes (018화, 020화) and KakaoTalk
-        elseif ($n -like "*KakaoTalk*" -or $n -like "*018$strHwa.*" -or $n -like "*020.*" -or $n -like "*020$strHwa.*") {
-            $col2List += $file
-        }
-        # Column 3 files: Episode 19 and text (019.hwpx, 019 수정1, 19화.txt)
-        elseif ($n -like "*019*" -or $n -like "*19$strHwa*") {
-            $col3List += $file
-        }
-        else {
-            if ($col1List.Count -le $col2List.Count -and $col1List.Count -le $col3List.Count) { $col1List += $file }
-            elseif ($col2List.Count -le $col3List.Count) { $col2List += $file }
-            else { $col3List += $file }
-        }
-    }
-
-    # Strict height balancing: guarantee equal column count (e.g. 5 / 5 / 5)
-    $targetPerCol = [int][Math]::Ceiling($rawItems.Count / 3.0)
-    while ($col3List.Count -gt $targetPerCol -and ($col2List.Count -lt $targetPerCol -or $col1List.Count -lt $targetPerCol)) {
-        if ($col2List.Count -lt $targetPerCol) {
-            $col2List += $col3List[-1]
-            $col3List = @($col3List[0..($col3List.Count - 2)])
-        } elseif ($col1List.Count -lt $targetPerCol) {
-            $col1List += $col3List[-1]
-            $col3List = @($col3List[0..($col3List.Count - 2)])
-        } else { break }
-    }
-    while ($col1List.Count -gt $targetPerCol -and ($col2List.Count -lt $targetPerCol -or $col3List.Count -lt $targetPerCol)) {
-        if ($col2List.Count -lt $targetPerCol) {
-            $col2List += $col1List[-1]
-            $col1List = @($col1List[0..($col1List.Count - 2)])
-        } elseif ($col3List.Count -lt $targetPerCol) {
-            $col3List += $col1List[-1]
-            $col1List = @($col1List[0..($col1List.Count - 2)])
-        } else { break }
-    }
-
-    # Exact Coordinates (User Display Matched)
+    # Coordinates
     $colX = @(5, 111, 217)
     $startY = 2
     $spacingY = 149
 
-    # Position Column 1
-    for ($r = 0; $r -lt $col1List.Count; $r++) {
-        $y = $startY + ($r * $spacingY)
-        [DesktopVerticalManager]::SetItemPosition($hListView, $col1List[$r].Index, $colX[0], $y)
-    }
-
-    # Position Column 2
-    for ($r = 0; $r -lt $col2List.Count; $r++) {
-        $y = $startY + ($r * $spacingY)
-        [DesktopVerticalManager]::SetItemPosition($hListView, $col2List[$r].Index, $colX[1], $y)
-    }
-
-    # Position Column 3
-    for ($r = 0; $r -lt $col3List.Count; $r++) {
-        $y = $startY + ($r * $spacingY)
-        [DesktopVerticalManager]::SetItemPosition($hListView, $col3List[$r].Index, $colX[2], $y)
+    for ($i = 0; $i -lt $masterList.Count; $i++) {
+        $col = $i % 3
+        $row = [Math]::Floor($i / 3.0)
+        $x = $colX[$col]
+        $y = $startY + ($row * $spacingY)
+        [DesktopVerticalManager]::SetItemPosition($hListView, $masterList[$i].Index, $x, $y)
     }
 
     [DesktopVerticalManager]::RefreshDesktop($hListView)
-    Write-Host "  [Arranged] Successfully matched 3-column vertical grid without gaps! (Col1: $($col1List.Count), Col2: $($col2List.Count), Col3: $($col3List.Count))"
+    Write-Host "  [Arranged] Placed $($masterList.Count) items in 3-column grid without gaps."
 }
 
 # --- FUNCTION: ONE-SHOT PIPELINE ---
@@ -517,7 +466,7 @@ function Execute-OrganizePipeline {
     Write-Host "[1/2] Resolving Jamo Decomposition..."
     Fix-JamoNormalization -targetDirectories ($desktopDirs + $downloadDirs)
 
-    Write-Host "[2/2] Arranging Desktop in 3 Vertical Columns (Screenshot Exact Match)..."
+    Write-Host "[2/2] Arranging Desktop in 3 Vertical Columns..."
     Invoke-DesktopArrangement
 }
 
@@ -553,9 +502,16 @@ function Setup-StartupAndDaemon {
         $encoded = [Convert]::ToBase64String($bytes)
         $daemonCmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $encoded"
         
-        $wsh = New-Object -ComObject WScript.Shell
-        $wsh.Run($daemonCmd, 0, $false)
-        Write-Host "[Daemon] Background monitor & vertical selection hook spawned."
+        $spawned = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine = $daemonCmd}
+        if ($spawned.ProcessId) {
+            [System.IO.File]::WriteAllText($pidFile, $spawned.ProcessId.ToString(), [System.Text.Encoding]::ASCII)
+            Write-Host "[Daemon] Background monitor & vertical selection hook spawned (PID: $($spawned.ProcessId))."
+        } else {
+            # Fallback to WScript.Shell
+            $wsh = New-Object -ComObject WScript.Shell
+            $wsh.Run($daemonCmd, 0, $false)
+            Write-Host "[Daemon] Background monitor & vertical selection hook spawned."
+        }
     } else {
         Write-Host "[Daemon] Background monitor daemon is already running."
     }
@@ -569,7 +525,7 @@ function Start-BackgroundWatcher {
     [System.IO.File]::WriteAllText($pidFile, $PID.ToString(), [System.Text.Encoding]::ASCII)
 
     $logPath = Join-Path $env:TEMP "DesktopOrganizer_daemon.log"
-    Add-Content -LiteralPath $logPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Daemon started with vertical selection hook. PID: $PID" -Force
+    Add-Content -LiteralPath $logPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Daemon started with native watcher & keyboard hook. PID: $PID" -Force
     
     try {
         Execute-OrganizePipeline
@@ -577,41 +533,26 @@ function Start-BackgroundWatcher {
         Add-Content -LiteralPath $logPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Initial pipeline error: $($_.Exception.ToString())"
     }
 
-    # Setup FileSystemWatcher
-    $watchers = @()
-    $timer = New-Object System.Timers.Timer
-    $timer.Interval = 2000
-    $timer.AutoReset = $false
-    
-    $timerAction = {
-        try {
-            Execute-OrganizePipeline
-        } catch {}
-    }
-    Register-ObjectEvent -InputObject $timer -EventName Elapsed -Action $timerAction | Out-Null
+    # Start Native C# FileSystemWatcher
+    [DesktopVerticalManager]::StartNativeWatcher($desktopDirs)
 
-    foreach ($dir in $desktopDirs) {
-        if (-not (Test-Path -LiteralPath $dir)) { continue }
-        $fsw = New-Object System.IO.FileSystemWatcher
-        $fsw.Path = $dir
-        $fsw.IncludeSubdirectories = $false
-        $fsw.EnableRaisingEvents = $true
-        
-        $changeAction = {
-            $name = $Event.SourceEventArgs.Name
-            if ($name -match '(\.tmp|~\$|\.crdownload|\.part)$') { return }
-            $timer.Stop()
-            $timer.Start()
+    # Start Keyboard Hook in background thread
+    [DesktopVerticalManager]::StartHookThread()
+
+    # Main thread polling loop (Thread-safe)
+    while ($true) {
+        if ([DesktopVerticalManager]::NeedsArrange) {
+            [DesktopVerticalManager]::NeedsArrange = $false
+            Add-Content -LiteralPath $logPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] File change detected. Triggering auto-arrangement..." -Force
+            try {
+                Execute-OrganizePipeline
+                Add-Content -LiteralPath $logPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Auto-arrangement successfully executed." -Force
+            } catch {
+                Add-Content -LiteralPath $logPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Auto-arrangement error: $($_.Exception.ToString())" -Force
+            }
         }
-
-        Register-ObjectEvent -InputObject $fsw -EventName Created -Action $changeAction | Out-Null
-        Register-ObjectEvent -InputObject $fsw -EventName Deleted -Action $changeAction | Out-Null
-        Register-ObjectEvent -InputObject $fsw -EventName Renamed -Action $changeAction | Out-Null
-        $watchers += $fsw
+        Start-Sleep -Milliseconds 300
     }
-
-    # Start Keyboard Hook Message Loop (Enables Shift+Down/Up vertical selection)
-    [DesktopVerticalManager]::StartHookLoop()
 }
 
 # --- MAIN DISPATCHER ---

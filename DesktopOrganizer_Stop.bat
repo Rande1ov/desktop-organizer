@@ -56,10 +56,13 @@ if (Test-Path -LiteralPath $pidFile) {
 
 # 2. Auxiliary check: scan any leftover daemon powershell instances
 $targetProcesses = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" | Where-Object { 
-    $_.CommandLine -like "*DesktopOrganizer_Start.bat*-DaemonMode*" 
+    ($_.CommandLine -like "*DesktopOrganizer_Start.bat*") -or 
+    ($_.CommandLine -like "*DesktopVerticalManager*") -or
+    ($_.CommandLine -like "*-DaemonMode*")
 }
 
 foreach ($proc in $targetProcesses) {
+    if ($proc.ProcessId -eq $PID) { continue }
     try {
         Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
         Write-Host "  [OK] Terminated leftover daemon (PID: $($proc.ProcessId))"
