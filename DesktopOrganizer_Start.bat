@@ -306,12 +306,12 @@ function Invoke-DesktopArrangement {
         $name = $item.Name.Trim()
         $priority = 4
         
-        # Priority 1: Recycle Bin
-        if (($recycleBinTitle -and ($name -eq $recycleBinTitle)) -or ($name -eq "Recycle Bin") -or ($name -eq "`uD734`uC9C0`uD1B5")) {
+        # Priority 1: Downloads (Folder / Shortcut)
+        if (($downloadsFolderTitle -and ($name -like "$downloadsFolderTitle*")) -or ($name -match '^(Downloads|`uB2E4`uC6B4`uB85C`uB4DC)(\.lnk)?$')) {
             $priority = 1
         }
-        # Priority 2: Downloads
-        elseif (($downloadsFolderTitle -and ($name -like "$downloadsFolderTitle*")) -or ($name -match '^(Downloads|`uB2E4`uC6B4`uB85C`uB4DC)(\.lnk)?$')) {
+        # Priority 2: Recycle Bin
+        elseif (($recycleBinTitle -and ($name -eq $recycleBinTitle)) -or ($name -eq "Recycle Bin") -or ($name -eq "`uD734`uC9C0`uD1B5")) {
             $priority = 2
         }
         else {
@@ -338,35 +338,27 @@ function Invoke-DesktopArrangement {
         }
     }
 
-    # Sort items: Priority -> Name
+    # Sort items: Priority (Downloads -> Recycle Bin -> Folders -> Files) then Name
     $sortedItems = $classified | Sort-Object -Property Priority, Name
 
-    # Metrics and Coordinates
-    $workArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-    $metricX = [DesktopCore]::GetSystemMetrics([DesktopCore]::SM_CXICONSPACING)
-    $metricY = [DesktopCore]::GetSystemMetrics([DesktopCore]::SM_CYICONSPACING)
-    
-    $spacingX = [Math]::Max(95, $metricX)
-    $spacingY = [Math]::Max(90, $metricY)
-
-    $startX = $workArea.Left + 20
-    $startY = $workArea.Top + 20
+    # Exact Grid Metrics matched to user's display
+    $startX = 5
+    $startY = 2
+    $spacingX = 106
+    $spacingY = 149
+    $columns = 3
 
     $totalCount = $sortedItems.Count
-    $screenMaxRows = [Math]::Max(1, [int][Math]::Floor(($workArea.Height - 40) / $spacingY))
-    
-    # 3-column height balance: evenly fill 3 columns with 0 empty gap
-    $targetRows = [int][Math]::Ceiling($totalCount / 3.0)
-    $rowsPerCol = [Math]::Min($screenMaxRows, [Math]::Max(1, $targetRows))
 
+    # Fill row-by-row into 3 columns with 0 empty gaps
+    # Row 0: Downloads (Col 0), Recycle Bin (Col 1), 1st Folder (Col 2)
+    # Row 1: 2nd Folder (Col 0), 3rd Folder (Col 1), 4th Folder (Col 2)
+    # Following rows: Files filling Col 0, 1, 2 consecutively
+    # Exact vertical alignment ensures Shift + Down arrow key navigation works perfectly.
     for ($i = 0; $i -lt $totalCount; $i++) {
         $item = $sortedItems[$i]
-        $col = [Math]::Min([int][Math]::Floor($i / $rowsPerCol), 2)
-        if ($col -lt 2) {
-            $row = $i % $rowsPerCol
-        } else {
-            $row = $i - (2 * $rowsPerCol)
-        }
+        $col = $i % $columns
+        $row = [int][Math]::Floor($i / [double]$columns)
         
         $x = $startX + ($col * $spacingX)
         $y = $startY + ($row * $spacingY)
@@ -375,7 +367,7 @@ function Invoke-DesktopArrangement {
     }
 
     [DesktopCore]::RefreshDesktop($hListView)
-    Write-Host "  [Arranged] $($totalCount) items aligned in 3 vertical columns."
+    Write-Host "  [Arranged] $($totalCount) items aligned in 3 columns without gaps (Row-by-row, Shift+Down optimized)."
 }
 
 # --- FUNCTION: ONE-SHOT PIPELINE ---
