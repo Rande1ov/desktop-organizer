@@ -58,6 +58,7 @@ public class DesktopOrganizerDaemon {
     [DllImport("kernel32.dll", SetLastError = true)] public static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, ref LVITEM lpBuffer, uint nSize, out IntPtr lpNumberOfBytesWritten);
     [DllImport("kernel32.dll", SetLastError = true)] public static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, uint nSize, out IntPtr lpNumberOfBytesRead);
     [DllImport("kernel32.dll", SetLastError = true)] public static extern bool CloseHandle(IntPtr hObject);
+    [DllImport("shlwapi.dll", CharSet = CharSet.Unicode)] private static extern int StrCmpLogicalW(string psz1, string psz2);
 
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
     private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
@@ -376,13 +377,9 @@ public class DesktopOrganizerDaemon {
 
             string strDownloads = "\uB2E4\uC6B4\uB85C\uB4DC";
             string strRecycle = "\uD734\uC9C0\uD1B5";
-            string strMod = "\uC218\uC815";
-            string strChef = "\uD658\uC0DD\uC170\uD504";
-            string strHwa = "\uD654";
 
-            List<DesktopItem> col1List = new List<DesktopItem>();
-            List<DesktopItem> col2List = new List<DesktopItem>();
-            List<DesktopItem> col3List = new List<DesktopItem>();
+            List<DesktopItem> specialDownloads = new List<DesktopItem>();
+            List<DesktopItem> specialRecycle = new List<DesktopItem>();
             List<DesktopItem> folders = new List<DesktopItem>();
             List<DesktopItem> files = new List<DesktopItem>();
 
@@ -391,83 +388,45 @@ public class DesktopOrganizerDaemon {
                 bool isDownloads = (n.IndexOf(strDownloads, StringComparison.OrdinalIgnoreCase) >= 0) || (n.IndexOf("Downloads", StringComparison.OrdinalIgnoreCase) >= 0);
                 bool isRecycle = (n == strRecycle) || (n.Equals("Recycle Bin", StringComparison.OrdinalIgnoreCase));
 
-                if (isDownloads) col1List.Add(item);
-                else if (isRecycle) col2List.Add(item);
+                if (isDownloads) specialDownloads.Add(item);
+                else if (isRecycle) specialRecycle.Add(item);
                 else if (item.IsDir) folders.Add(item);
                 else files.Add(item);
             }
 
-            folders.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.CurrentCultureIgnoreCase));
-            foreach (DesktopItem f in folders) {
-                if (f.Name.IndexOf("officedocs", StringComparison.OrdinalIgnoreCase) >= 0) col1List.Add(f);
-                else if (f.Name.IndexOf("workspace", StringComparison.OrdinalIgnoreCase) >= 0) col2List.Add(f);
-                else if (f.Name.IndexOf("games", StringComparison.OrdinalIgnoreCase) >= 0 || f.Name.IndexOf(strChef, StringComparison.OrdinalIgnoreCase) >= 0) col3List.Add(f);
-                else {
-                    if (col1List.Count <= col2List.Count && col1List.Count <= col3List.Count) col1List.Add(f);
-                    else if (col2List.Count <= col3List.Count) col2List.Add(f);
-                    else col3List.Add(f);
-                }
-            }
+            // Windows Explorer natural sorting (StrCmpLogicalW)
+            folders.Sort((a, b) => StrCmpLogicalW(a.Name, b.Name));
+            files.Sort((a, b) => StrCmpLogicalW(a.Name, b.Name));
 
-            files.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.CurrentCultureIgnoreCase));
-            foreach (DesktopItem file in files) {
-                string n = file.Name;
-                if ((n.Contains(strMod) && n.Contains("2")) || (n.Contains(strMod) && n.Contains("1") && n.Contains("020"))) {
-                    col1List.Add(file);
-                } else if (n.IndexOf("KakaoTalk", StringComparison.OrdinalIgnoreCase) >= 0 || n.Contains("018" + strHwa + ".") || n.Contains("020.") || n.Contains("020" + strHwa + ".")) {
-                    col2List.Add(file);
-                } else if (n.Contains("019") || n.Contains("19" + strHwa)) {
-                    col3List.Add(file);
-                } else {
-                    if (col1List.Count <= col2List.Count && col1List.Count <= col3List.Count) col1List.Add(file);
-                    else if (col2List.Count <= col3List.Count) col2List.Add(file);
-                    else col3List.Add(file);
-                }
-            }
-
-            int targetPerCol = (int)Math.Ceiling(rawItems.Count / 3.0);
-            while (col3List.Count > targetPerCol && (col2List.Count < targetPerCol || col1List.Count < targetPerCol)) {
-                if (col2List.Count < targetPerCol) {
-                    col2List.Add(col3List[col3List.Count - 1]);
-                    col3List.RemoveAt(col3List.Count - 1);
-                } else if (col1List.Count < targetPerCol) {
-                    col1List.Add(col3List[col3List.Count - 1]);
-                    col3List.RemoveAt(col3List.Count - 1);
-                } else break;
-            }
-            while (col1List.Count > targetPerCol && (col2List.Count < targetPerCol || col3List.Count < targetPerCol)) {
-                if (col2List.Count < targetPerCol) {
-                    col2List.Add(col1List[col1List.Count - 1]);
-                    col1List.RemoveAt(col1List.Count - 1);
-                } else if (col3List.Count < targetPerCol) {
-                    col3List.Add(col1List[col1List.Count - 1]);
-                    col1List.RemoveAt(col1List.Count - 1);
-                } else break;
-            }
+            // Row-major master order: 1 2 3 / 4 5 6 / 7 8 9
+            List<DesktopItem> masterList = new List<DesktopItem>();
+            masterList.AddRange(specialDownloads);
+            masterList.AddRange(specialRecycle);
+            masterList.AddRange(folders);
+            masterList.AddRange(files);
 
             int[] colX = new int[] { 5, 111, 217 };
             int startY = 2;
             int spacingY = 154;
             int tol = onlyIfNeeded ? 15 : 2;
 
-            List<DesktopItem>[] cols = new List<DesktopItem>[] { col1List, col2List, col3List };
-            for (int c = 0; c < 3; c++) {
-                for (int r = 0; r < cols[c].Count; r++) {
-                    int targetX = colX[c];
-                    int targetY = startY + (r * spacingY);
-                    DesktopItem it = cols[c][r];
-                    if (Math.Abs(it.X - targetX) > tol || Math.Abs(it.Y - targetY) > tol) {
-                        int lParam = (targetY << 16) | (targetX & 0xFFFF);
-                        SendMessage(hList, LVM_SETITEMPOSITION, (IntPtr)it.Index, (IntPtr)lParam);
-                        mCount++;
-                    }
+            for (int i = 0; i < masterList.Count; i++) {
+                int c = i % 3;
+                int r = i / 3;
+                int targetX = colX[c];
+                int targetY = startY + (r * spacingY);
+                DesktopItem it = masterList[i];
+                if (Math.Abs(it.X - targetX) > tol || Math.Abs(it.Y - targetY) > tol) {
+                    int lParam = (targetY << 16) | (targetX & 0xFFFF);
+                    SendMessage(hList, LVM_SETITEMPOSITION, (IntPtr)it.Index, (IntPtr)lParam);
+                    mCount++;
                 }
             }
 
             if (mCount > 0 || !onlyIfNeeded) {
                 if (mCount > 0) {
                     RedrawWindow(hList, IntPtr.Zero, IntPtr.Zero, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
-                    Log(string.Format("Arranged {0} items (moved {1}; Col1:{2}, Col2:{3}, Col3:{4}).", rawItems.Count, mCount, col1List.Count, col2List.Count, col3List.Count));
+                    Log(string.Format("Arranged {0} items in Row-Major 3-column order (moved {1}).", masterList.Count, mCount));
                 }
             }
         });
