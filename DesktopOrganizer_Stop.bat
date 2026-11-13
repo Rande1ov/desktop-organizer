@@ -18,56 +18,81 @@ param(
     [string]$BatchPath = ""
 )
 
-# --- PURE ENGLISH POWERSHELL SCRIPT ENGINE ---
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-Write-Host "[1/2] Removing startup trigger from shell:startup..."
+Write-Host "[1/2] Removing Windows startup registrations..."
+$taskName = "DesktopOrganizerDaemon"
+$task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+if ($task) {
+    try { Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue } catch {}
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    Write-Host "  [OK] Removed Scheduled Task: $taskName"
+} else {
+    Write-Host "  [Info] Scheduled Task was not registered."
+}
+
+$runKeyPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+if (Get-ItemProperty -Path $runKeyPath -Name "DesktopOrganizer" -ErrorAction SilentlyContinue) {
+    Remove-ItemProperty -Path $runKeyPath -Name "DesktopOrganizer" -Force -ErrorAction SilentlyContinue
+    Write-Host "  [OK] Removed registry Run entry: DesktopOrganizer"
+}
+
 $startupFolder = [Environment]::GetFolderPath('Startup')
 $vbsPath = Join-Path $startupFolder "DesktopOrganizer_Startup.vbs"
 if (Test-Path -LiteralPath $vbsPath) {
     Remove-Item -LiteralPath $vbsPath -Force -ErrorAction SilentlyContinue
-    Write-Host "  [OK] Removed: $vbsPath"
-} else {
-    Write-Host "  [Info] Startup trigger was not registered."
+    Write-Host "  [OK] Removed legacy VBS: $vbsPath"
 }
 
-Write-Host "[2/2] Stopping background monitor processes..."
-$scriptDir = Split-Path -Parent $BatchPath
-if (-not $scriptDir) { $scriptDir = (Get-Location).Path }
-$pidFile = Join-Path $scriptDir "desktop_organizer.pid"
-
+Write-Host "[2/2] Stopping background daemon processes..."
 $stoppedCount = 0
 
-# 1. Stop via PID file
-if (Test-Path -LiteralPath $pidFile) {
-    try {
-        $savedPid = (Get-Content -LiteralPath $pidFile -Raw).Trim()
-        if ($savedPid) {
-            $p = Get-Process -Id ([int]$savedPid) -ErrorAction SilentlyContinue
-            if ($p) {
-                Stop-Process -Id $p.Id -Force
-                Write-Host "  [OK] Terminated daemon process via PID file (PID: $($p.Id))"
-                $stoppedCount++
+$pidFiles = @(
+    (Join-Path $env:LOCALAPPDATA "DesktopOrganizer\desktop_organizer.pid")
+)
+$scriptDir = Split-Path -Parent $BatchPath
+if ($scriptDir) {
+    $pidFiles += (Join-Path $scriptDir "desktop_organizer.pid")
+}
+
+foreach ($pf in $pidFiles) {
+    if (Test-Path -LiteralPath $pf) {
+        try {
+            $savedPid = (Get-Content -LiteralPath $pf -Raw).Trim()
+            if ($savedPid) {
+                $p = Get-Process -Id ([int]$savedPid) -ErrorAction SilentlyContinue
+                if ($p) {
+                    Stop-Process -Id $p.Id -Force -ErrorAction Stop
+                    Write-Host "  [OK] Terminated daemon via PID file (PID: $($p.Id))"
+                    $stoppedCount++
+                }
             }
-        }
-    } catch {}
-    Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
+        } catch {}
+        Remove-Item -LiteralPath $pf -Force -ErrorAction SilentlyContinue
+    }
 }
 
-# 2. Auxiliary check: scan any leftover daemon powershell instances
-$targetProcesses = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" | Where-Object { 
-    ($_.CommandLine -like "*DesktopOrganizer_Start.bat*") -or 
-    ($_.CommandLine -like "*DesktopVerticalManager*") -or
-    ($_.CommandLine -like "*-DaemonMode*")
-}
-
-foreach ($proc in $targetProcesses) {
+$psProcs = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'"
+foreach ($proc in $psProcs) {
     if ($proc.ProcessId -eq $PID) { continue }
-    try {
-        Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
-        Write-Host "  [OK] Terminated leftover daemon (PID: $($proc.ProcessId))"
-        $stoppedCount++
-    } catch {}
+    $cmd = $proc.CommandLine
+    if (-not $cmd) { continue }
+    $isTarget = ($cmd -like "*DesktopOrganizer_Start.bat*-DaemonMode*") -or ($cmd -like "*DesktopOrganizerDaemon*")
+    if (-not $isTarget -and $cmd -match '-EncodedCommand\s+([A-Za-z0-9+/=]+)') {
+        try {
+            $decoded = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($matches[1]))
+            if ($decoded -like "*-DaemonMode*") {
+                $isTarget = $true
+            }
+        } catch {}
+    }
+    if ($isTarget) {
+        try {
+            Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
+            Write-Host "  [OK] Terminated daemon process (PID: $($proc.ProcessId))"
+            $stoppedCount++
+        } catch {}
+    }
 }
 
 if ($stoppedCount -eq 0) {

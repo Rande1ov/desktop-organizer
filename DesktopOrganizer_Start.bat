@@ -3,19 +3,12 @@
 setlocal
 cd /d "%~dp0"
 
-:: Check if launched with -daemon flag
-if "%~1"=="-daemon" (
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "$p='%~f0'; & ([scriptblock]::Create((Get-Content -LiteralPath $p -Encoding UTF8 -Raw))) -DaemonMode -BatchPath $p"
-    exit /b 0
-)
-
-:: Normal User Launch (Interactive)
 cls
 echo ========================================================
 echo        Desktop 3-Column Organizer and Jamo Fixer
 echo ========================================================
 echo.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p='%~f0'; & ([scriptblock]::Create((Get-Content -LiteralPath $p -Encoding UTF8 -Raw))) -BatchPath $p"
+powershell.exe -STA -NoProfile -ExecutionPolicy Bypass -Command "$p='%~f0'; & ([scriptblock]::Create((Get-Content -LiteralPath $p -Encoding UTF8 -Raw))) -BatchPath $p"
 echo.
 echo Process complete. This window will close shortly.
 powershell.exe -NoProfile -Command "Start-Sleep -Seconds 2"
@@ -28,8 +21,7 @@ param(
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-# --- WIN32 / C# VERTICAL MANAGER & NATIVE WATCHER & KEYBOARD HOOK ---
-$cSharpCode = @'
+$cSharpSource = @'
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -37,8 +29,10 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using System.Windows.Forms;
+using Microsoft.Win32;
 
-public class DesktopVerticalManager {
+public class DesktopOrganizerDaemon {
     [DllImport("user32.dll", SetLastError = true)] public static extern IntPtr OpenDesktop(string lpszDesktop, uint dwFlags, bool fInherit, uint dwDesiredAccess);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool SetThreadDesktop(IntPtr hDesktop);
     [DllImport("user32.dll")] public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
@@ -57,9 +51,6 @@ public class DesktopVerticalManager {
     [DllImport("user32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool UnhookWindowsHookEx(IntPtr hhk);
     [DllImport("user32.dll")] private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
     [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)] private static extern IntPtr GetModuleHandle(string lpModuleName);
-    [DllImport("user32.dll")] private static extern int GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
-    [DllImport("user32.dll")] private static extern bool TranslateMessage([In] ref MSG lpMsg);
-    [DllImport("user32.dll")] private static extern IntPtr DispatchMessage([In] ref MSG lpMsg);
 
     [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
     [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr VirtualAllocEx(IntPtr hProcess, IntPtr lpAddress, uint dwSize, uint flAllocationType, uint flProtect);
@@ -92,6 +83,8 @@ public class DesktopVerticalManager {
     private const int WH_KEYBOARD_LL = 13;
     private const int WM_KEYDOWN = 0x0100;
     private const int WM_KEYUP = 0x0101;
+    private const int VK_LBUTTON = 0x01;
+    private const int VK_RBUTTON = 0x02;
     private const int VK_SHIFT = 0x10;
     private const int VK_LEFT = 0x25;
     private const int VK_UP = 0x26;
@@ -103,11 +96,13 @@ public class DesktopVerticalManager {
         public uint mask; public int iItem; public int iSubItem; public uint state; public uint stateMask; public IntPtr pszText; public int cchTextMax; public int iImage; public IntPtr lParam; public int iIndent; public int iGroupId; public uint cColumns; public IntPtr puColumns; public IntPtr piColFmt; public int iGroup;
     }
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int x; public int y; }
-    [StructLayout(LayoutKind.Sequential)] public struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public POINT pt; }
 
-    public class ItemEntry {
+    public class DesktopItem {
         public int Index;
         public string Name;
+        public int X;
+        public int Y;
+        public bool IsDir;
     }
 
     public class PosItem {
@@ -116,15 +111,371 @@ public class DesktopVerticalManager {
         public int Y;
     }
 
+    private static Mutex _mutex = null;
     private static IntPtr _hookId = IntPtr.Zero;
     private static LowLevelKeyboardProc _proc = HookCallback;
-    private static Thread _hookThread = null;
     private static int _anchorIndex = -1;
 
-    // Native Watcher variables (Thread-safe flag)
-    public static volatile bool NeedsArrange = false;
+    private static List<string> _desktopDirs = new List<string>();
+    private static List<string> _downloadDirs = new List<string>();
     private static List<FileSystemWatcher> _watchers = new List<FileSystemWatcher>();
-    private static System.Threading.Timer _debounceTimer = null;
+    private static System.Threading.Timer _stage1Timer = null;
+    private static System.Threading.Timer _stage2Timer = null;
+    private static System.Windows.Forms.Timer _watchdogTimer = null;
+    private static volatile bool _pendingArrange = false;
+    private static readonly object _arrangeLock = new object();
+    private static string _logPath = Path.Combine(Path.GetTempPath(), "DesktopOrganizer_daemon.log");
+
+    private static void Log(string msg) {
+        try {
+            string line = string.Format("[{0}] {1}{2}", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), msg, Environment.NewLine);
+            File.AppendAllText(_logPath, line, Encoding.UTF8);
+        } catch {}
+    }
+
+    public static string RunOnce() {
+        DiscoverDirectories();
+        int moved = 0;
+        int total = 0;
+        lock (_arrangeLock) {
+            FixJamoNormalization();
+            ArrangeDesktop(false, out total, out moved);
+        }
+        return string.Format("Processed {0} items (repositioned {1}).", total, moved);
+    }
+
+    public static void RunDaemon() {
+        bool createdNew;
+        _mutex = new Mutex(true, "Local\\DesktopOrganizerDaemon_SingleInstance", out createdNew);
+        if (!createdNew) {
+            return;
+        }
+
+        try {
+            IntPtr hDefault = OpenDesktop("Default", 0, false, 0x01FF);
+            if (hDefault != IntPtr.Zero) SetThreadDesktop(hDefault);
+            DiscoverDirectories();
+            Log("Interactive STA Daemon started. PID: " + Process.GetCurrentProcess().Id);
+
+            int total, moved;
+            lock (_arrangeLock) {
+                FixJamoNormalization();
+                ArrangeDesktop(false, out total, out moved);
+            }
+
+            _stage1Timer = new System.Threading.Timer((s) => { _pendingArrange = true; }, null, Timeout.Infinite, Timeout.Infinite);
+            _stage2Timer = new System.Threading.Timer((s) => { _pendingArrange = true; }, null, Timeout.Infinite, Timeout.Infinite);
+
+            StartFileWatchers();
+            InstallKeyboardHook();
+
+            _watchdogTimer = new System.Windows.Forms.Timer();
+            _watchdogTimer.Interval = 500;
+            int tickCount = 0;
+            _watchdogTimer.Tick += (s, e) => {
+                tickCount++;
+                if (_pendingArrange) {
+                    _pendingArrange = false;
+                    RunOrganizePipeline(false);
+                    tickCount = 0;
+                } else if (tickCount >= 4) {
+                    tickCount = 0;
+                    if (!IsMouseButtonDown()) {
+                        RunOrganizePipeline(true);
+                    }
+                }
+            };
+            _watchdogTimer.Start();
+
+            Application.Run();
+        } catch (Exception ex) {
+            Log("Fatal daemon error: " + ex.ToString());
+        } finally {
+            if (_hookId != IntPtr.Zero) {
+                UnhookWindowsHookEx(_hookId);
+                _hookId = IntPtr.Zero;
+            }
+            if (_mutex != null) {
+                try { _mutex.ReleaseMutex(); } catch {}
+            }
+        }
+    }
+
+    private static bool IsMouseButtonDown() {
+        return (GetAsyncKeyState(VK_LBUTTON) < 0) || (GetAsyncKeyState(VK_RBUTTON) < 0);
+    }
+
+    private static void DiscoverDirectories() {
+        _desktopDirs.Clear();
+        _downloadDirs.Clear();
+
+        try {
+            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders")) {
+                if (key != null) {
+                    object val = key.GetValue("Desktop");
+                    if (val != null) {
+                        string expanded = Environment.ExpandEnvironmentVariables(val.ToString());
+                        if (Directory.Exists(expanded) && !_desktopDirs.Contains(expanded)) _desktopDirs.Add(expanded);
+                    }
+                }
+            }
+        } catch {}
+
+        string hyunfield = @"C:\Users\guswn\OneDrive\Hyunfield";
+        if (Directory.Exists(hyunfield) && !_desktopDirs.Contains(hyunfield)) _desktopDirs.Add(hyunfield);
+
+        string envDesktop = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
+        if (!string.IsNullOrEmpty(envDesktop) && Directory.Exists(envDesktop) && !_desktopDirs.Contains(envDesktop)) _desktopDirs.Add(envDesktop);
+
+        string userProf = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        string stdDesktop = Path.Combine(userProf, "Desktop");
+        if (Directory.Exists(stdDesktop) && !_desktopDirs.Contains(stdDesktop)) _desktopDirs.Add(stdDesktop);
+
+        string odDown = Path.Combine(userProf, "OneDrive\\\uB2E4\uC6B4\uB85C\uB4DC");
+        if (Directory.Exists(odDown) && !_downloadDirs.Contains(odDown)) _downloadDirs.Add(odDown);
+
+        string stdDown = Path.Combine(userProf, "Downloads");
+        if (Directory.Exists(stdDown) && !_downloadDirs.Contains(stdDown)) _downloadDirs.Add(stdDown);
+    }
+
+    private static void StartFileWatchers() {
+        foreach (string path in _desktopDirs) {
+            try {
+                FileSystemWatcher fsw = new FileSystemWatcher(path);
+                fsw.NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite;
+                fsw.IncludeSubdirectories = false;
+
+                FileSystemEventHandler onFsEvent = (s, e) => {
+                    if (e.Name != null && (e.Name.EndsWith(".tmp") || e.Name.StartsWith("~$") || e.Name.StartsWith("jamo_tmp_"))) return;
+                    _stage1Timer.Change(500, Timeout.Infinite);
+                    _stage2Timer.Change(1500, Timeout.Infinite);
+                };
+
+                fsw.Created += onFsEvent;
+                fsw.Deleted += onFsEvent;
+                fsw.Renamed += (s, e) => {
+                    if (e.Name != null && (e.Name.EndsWith(".tmp") || e.Name.StartsWith("~$") || e.Name.StartsWith("jamo_tmp_"))) return;
+                    _stage1Timer.Change(500, Timeout.Infinite);
+                    _stage2Timer.Change(1500, Timeout.Infinite);
+                };
+                fsw.EnableRaisingEvents = true;
+                _watchers.Add(fsw);
+            } catch (Exception ex) {
+                Log("Watcher error on " + path + ": " + ex.Message);
+            }
+        }
+        Log("Watching Desktop dirs: " + string.Join(" | ", _desktopDirs.ToArray()));
+    }
+
+    private static void FixJamoNormalization() {
+        List<string> allDirs = new List<string>();
+        allDirs.AddRange(_desktopDirs);
+        allDirs.AddRange(_downloadDirs);
+
+        foreach (string dir in allDirs) {
+            if (!Directory.Exists(dir)) continue;
+            try {
+                foreach (string entryPath in Directory.GetFileSystemEntries(dir)) {
+                    string rawName = Path.GetFileName(entryPath);
+                    string nfcName = rawName.Normalize(NormalizationForm.FormC);
+                    if (rawName != nfcName) {
+                        string parent = Path.GetDirectoryName(entryPath);
+                        string tempPath = Path.Combine(parent, "jamo_tmp_" + Guid.NewGuid().ToString("N"));
+                        string finalPath = Path.Combine(parent, nfcName);
+                        try {
+                            if (Directory.Exists(entryPath)) {
+                                Directory.Move(entryPath, tempPath);
+                                Directory.Move(tempPath, finalPath);
+                            } else if (File.Exists(entryPath)) {
+                                File.Move(entryPath, tempPath);
+                                File.Move(tempPath, finalPath);
+                            }
+                            Log("Jamo fixed: " + rawName + " -> " + nfcName);
+                        } catch {}
+                    }
+                }
+            } catch {}
+        }
+    }
+
+    private static void RunOrganizePipeline(bool onlyIfNeeded) {
+        lock (_arrangeLock) {
+            try {
+                FixJamoNormalization();
+                int total, moved;
+                ArrangeDesktop(onlyIfNeeded, out total, out moved);
+            } catch (Exception ex) {
+                Log("Pipeline error: " + ex.Message);
+            }
+        }
+    }
+
+    private static void ArrangeDesktop(bool onlyIfNeeded, out int totalCount, out int movedCount) {
+        int tCount = 0;
+        int mCount = 0;
+        Thread worker = new Thread(() => {
+            IntPtr hDefault = OpenDesktop("Default", 0, false, 0x01FF);
+            if (hDefault != IntPtr.Zero) SetThreadDesktop(hDefault);
+            IntPtr hList = FindListView();
+            if (hList == IntPtr.Zero) return;
+
+            int style = GetWindowLong(hList, GWL_STYLE);
+            if ((style & LVS_AUTOARRANGE) != 0) {
+                SetWindowLong(hList, GWL_STYLE, style & ~LVS_AUTOARRANGE);
+            }
+
+            int count = (int)SendMessage(hList, LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero);
+            if (count <= 0) return;
+            tCount = count;
+
+            uint pid;
+            GetWindowThreadProcessId(hList, out pid);
+            IntPtr hProc = OpenProcess(0x0038, false, pid);
+            if (hProc == IntPtr.Zero) return;
+
+            List<DesktopItem> rawItems = new List<DesktopItem>();
+            int bufferSize = 512;
+            IntPtr pMem = VirtualAllocEx(hProc, IntPtr.Zero, (uint)(Marshal.SizeOf(typeof(LVITEM)) + bufferSize), 0x1000, 0x04);
+            IntPtr pPoint = VirtualAllocEx(hProc, IntPtr.Zero, (uint)Marshal.SizeOf(typeof(POINT)), 0x1000, 0x04);
+            IntPtr pText = new IntPtr(pMem.ToInt64() + Marshal.SizeOf(typeof(LVITEM)));
+            byte[] ptb = new byte[Marshal.SizeOf(typeof(POINT))];
+            byte[] textBuffer = new byte[bufferSize];
+
+            for (int i = 0; i < count; i++) {
+                LVITEM item = new LVITEM();
+                item.mask = 1;
+                item.iItem = i;
+                item.pszText = pText;
+                item.cchTextMax = 250;
+                IntPtr written;
+                WriteProcessMemory(hProc, pMem, ref item, (uint)Marshal.SizeOf(typeof(LVITEM)), out written);
+                SendMessage(hList, LVM_GETITEMTEXTW, (IntPtr)i, pMem);
+                IntPtr read;
+                ReadProcessMemory(hProc, pText, textBuffer, (uint)bufferSize, out read);
+                string text = Encoding.Unicode.GetString(textBuffer).Split('\0')[0].Trim();
+
+                SendMessage(hList, LVM_GETITEMPOSITION, (IntPtr)i, pPoint);
+                ReadProcessMemory(hProc, pPoint, ptb, (uint)ptb.Length, out read);
+                int x = BitConverter.ToInt32(ptb, 0);
+                int y = BitConverter.ToInt32(ptb, 4);
+
+                bool isDir = false;
+                foreach (string d in _desktopDirs) {
+                    if (Directory.Exists(Path.Combine(d, text))) {
+                        isDir = true;
+                        break;
+                    }
+                }
+
+                rawItems.Add(new DesktopItem { Index = i, Name = text, X = x, Y = y, IsDir = isDir });
+            }
+
+            VirtualFreeEx(hProc, pMem, 0, 0x8000);
+            VirtualFreeEx(hProc, pPoint, 0, 0x8000);
+            CloseHandle(hProc);
+
+            string strDownloads = "\uB2E4\uC6B4\uB85C\uB4DC";
+            string strRecycle = "\uD734\uC9C0\uD1B5";
+            string strMod = "\uC218\uC815";
+            string strChef = "\uD658\uC0DD\uC170\uD504";
+            string strHwa = "\uD654";
+
+            List<DesktopItem> col1List = new List<DesktopItem>();
+            List<DesktopItem> col2List = new List<DesktopItem>();
+            List<DesktopItem> col3List = new List<DesktopItem>();
+            List<DesktopItem> folders = new List<DesktopItem>();
+            List<DesktopItem> files = new List<DesktopItem>();
+
+            foreach (DesktopItem item in rawItems) {
+                string n = item.Name;
+                bool isDownloads = (n.IndexOf(strDownloads, StringComparison.OrdinalIgnoreCase) >= 0) || (n.IndexOf("Downloads", StringComparison.OrdinalIgnoreCase) >= 0);
+                bool isRecycle = (n == strRecycle) || (n.Equals("Recycle Bin", StringComparison.OrdinalIgnoreCase));
+
+                if (isDownloads) col1List.Add(item);
+                else if (isRecycle) col2List.Add(item);
+                else if (item.IsDir) folders.Add(item);
+                else files.Add(item);
+            }
+
+            folders.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.CurrentCultureIgnoreCase));
+            foreach (DesktopItem f in folders) {
+                if (f.Name.IndexOf("officedocs", StringComparison.OrdinalIgnoreCase) >= 0) col1List.Add(f);
+                else if (f.Name.IndexOf("workspace", StringComparison.OrdinalIgnoreCase) >= 0) col2List.Add(f);
+                else if (f.Name.IndexOf("games", StringComparison.OrdinalIgnoreCase) >= 0 || f.Name.IndexOf(strChef, StringComparison.OrdinalIgnoreCase) >= 0) col3List.Add(f);
+                else {
+                    if (col1List.Count <= col2List.Count && col1List.Count <= col3List.Count) col1List.Add(f);
+                    else if (col2List.Count <= col3List.Count) col2List.Add(f);
+                    else col3List.Add(f);
+                }
+            }
+
+            files.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.CurrentCultureIgnoreCase));
+            foreach (DesktopItem file in files) {
+                string n = file.Name;
+                if ((n.Contains(strMod) && n.Contains("2")) || (n.Contains(strMod) && n.Contains("1") && n.Contains("020"))) {
+                    col1List.Add(file);
+                } else if (n.IndexOf("KakaoTalk", StringComparison.OrdinalIgnoreCase) >= 0 || n.Contains("018" + strHwa + ".") || n.Contains("020.") || n.Contains("020" + strHwa + ".")) {
+                    col2List.Add(file);
+                } else if (n.Contains("019") || n.Contains("19" + strHwa)) {
+                    col3List.Add(file);
+                } else {
+                    if (col1List.Count <= col2List.Count && col1List.Count <= col3List.Count) col1List.Add(file);
+                    else if (col2List.Count <= col3List.Count) col2List.Add(file);
+                    else col3List.Add(file);
+                }
+            }
+
+            int targetPerCol = (int)Math.Ceiling(rawItems.Count / 3.0);
+            while (col3List.Count > targetPerCol && (col2List.Count < targetPerCol || col1List.Count < targetPerCol)) {
+                if (col2List.Count < targetPerCol) {
+                    col2List.Add(col3List[col3List.Count - 1]);
+                    col3List.RemoveAt(col3List.Count - 1);
+                } else if (col1List.Count < targetPerCol) {
+                    col1List.Add(col3List[col3List.Count - 1]);
+                    col3List.RemoveAt(col3List.Count - 1);
+                } else break;
+            }
+            while (col1List.Count > targetPerCol && (col2List.Count < targetPerCol || col3List.Count < targetPerCol)) {
+                if (col2List.Count < targetPerCol) {
+                    col2List.Add(col1List[col1List.Count - 1]);
+                    col1List.RemoveAt(col1List.Count - 1);
+                } else if (col3List.Count < targetPerCol) {
+                    col3List.Add(col1List[col1List.Count - 1]);
+                    col1List.RemoveAt(col1List.Count - 1);
+                } else break;
+            }
+
+            int[] colX = new int[] { 5, 111, 217 };
+            int startY = 2;
+            int spacingY = 154;
+            int tol = onlyIfNeeded ? 15 : 2;
+
+            List<DesktopItem>[] cols = new List<DesktopItem>[] { col1List, col2List, col3List };
+            for (int c = 0; c < 3; c++) {
+                for (int r = 0; r < cols[c].Count; r++) {
+                    int targetX = colX[c];
+                    int targetY = startY + (r * spacingY);
+                    DesktopItem it = cols[c][r];
+                    if (Math.Abs(it.X - targetX) > tol || Math.Abs(it.Y - targetY) > tol) {
+                        int lParam = (targetY << 16) | (targetX & 0xFFFF);
+                        SendMessage(hList, LVM_SETITEMPOSITION, (IntPtr)it.Index, (IntPtr)lParam);
+                        mCount++;
+                    }
+                }
+            }
+
+            if (mCount > 0 || !onlyIfNeeded) {
+                if (mCount > 0) {
+                    RedrawWindow(hList, IntPtr.Zero, IntPtr.Zero, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+                    Log(string.Format("Arranged {0} items (moved {1}; Col1:{2}, Col2:{3}, Col3:{4}).", rawItems.Count, mCount, col1List.Count, col2List.Count, col3List.Count));
+                }
+            }
+        });
+        worker.Start();
+        worker.Join();
+        totalCount = tCount;
+        movedCount = mCount;
+    }
 
     public static IntPtr FindListView() {
         IntPtr hProgman = FindWindow("Progman", null);
@@ -162,28 +513,38 @@ public class DesktopVerticalManager {
         VirtualFreeEx(hProc, pMem, 0, 0x8000);
     }
 
+    private static void InstallKeyboardHook() {
+        using (Process curProcess = Process.GetCurrentProcess())
+        using (ProcessModule curModule = curProcess.MainModule) {
+            _hookId = SetWindowsHookEx(WH_KEYBOARD_LL, _proc, GetModuleHandle(curModule.ModuleName), 0);
+        }
+        Log("Keyboard hook installed: " + (_hookId != IntPtr.Zero));
+    }
+
     private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam) {
-        if (nCode >= 0) {
-            int vkCode = Marshal.ReadInt32(lParam);
-            if (wParam == (IntPtr)WM_KEYUP && (vkCode == VK_SHIFT || vkCode == 0xA0 || vkCode == 0xA1)) {
-                _anchorIndex = -1;
-            } else if (wParam == (IntPtr)WM_KEYDOWN) {
-                bool isShift = (GetAsyncKeyState(VK_SHIFT) < 0);
-                if (!isShift) {
+        try {
+            if (nCode >= 0) {
+                int vkCode = Marshal.ReadInt32(lParam);
+                if (wParam == (IntPtr)WM_KEYUP && (vkCode == VK_SHIFT || vkCode == 0xA0 || vkCode == 0xA1)) {
                     _anchorIndex = -1;
-                } else if (IsDesktopForeground()) {
-                    if (vkCode == VK_DOWN || vkCode == VK_UP) {
-                        if (HandleVerticalSelection(vkCode == VK_DOWN)) {
-                            return (IntPtr)1; // Suppress default horizontal selection
-                        }
-                    } else if (vkCode == VK_RIGHT || vkCode == VK_LEFT) {
-                        if (HandleHorizontalSelection(vkCode == VK_RIGHT)) {
-                            return (IntPtr)1; // Suppress default selection
+                } else if (wParam == (IntPtr)WM_KEYDOWN) {
+                    bool isShift = (GetAsyncKeyState(VK_SHIFT) < 0);
+                    if (!isShift) {
+                        _anchorIndex = -1;
+                    } else if (IsDesktopForeground()) {
+                        if (vkCode == VK_DOWN || vkCode == VK_UP) {
+                            if (HandleVerticalSelection(vkCode == VK_DOWN)) {
+                                return (IntPtr)1;
+                            }
+                        } else if (vkCode == VK_RIGHT || vkCode == VK_LEFT) {
+                            if (HandleHorizontalSelection(vkCode == VK_RIGHT)) {
+                                return (IntPtr)1;
+                            }
                         }
                     }
                 }
             }
-        }
+        } catch {}
         return CallNextHookEx(_hookId, nCode, wParam, lParam);
     }
 
@@ -207,7 +568,6 @@ public class DesktopVerticalManager {
         SendMessage(hList, LVM_GETITEMPOSITION, (IntPtr)focused, pPoint);
         ReadProcessMemory(hProc, pPoint, ptb, (uint)ptb.Length, out read);
         int curX = BitConverter.ToInt32(ptb, 0);
-        int curY = BitConverter.ToInt32(ptb, 4);
 
         List<PosItem> colItems = new List<PosItem>();
         for (int i = 0; i < count; i++) {
@@ -248,7 +608,7 @@ public class DesktopVerticalManager {
         int targetPos = isDown ? (curPos + 1) : (curPos - 1);
         if (targetPos < 0 || targetPos >= colItems.Count) {
             CloseHandle(hProc);
-            return true; // Reached column boundary
+            return true;
         }
 
         int minP = Math.Min(anchorPos, targetPos);
@@ -256,14 +616,12 @@ public class DesktopVerticalManager {
         int oldMinP = Math.Min(anchorPos, curPos);
         int oldMaxP = Math.Max(anchorPos, curPos);
 
-        // Deselect items that left the range
         for (int p = oldMinP; p <= oldMaxP; p++) {
             if (p < minP || p > maxP) {
                 SetItemStateSafely(hProc, hList, colItems[p].Index, 0, (uint)LVIS_SELECTED);
             }
         }
 
-        // Select items in new range & focus target
         for (int p = minP; p <= maxP; p++) {
             uint state = (uint)LVIS_SELECTED;
             uint mask = (uint)LVIS_SELECTED;
@@ -310,8 +668,6 @@ public class DesktopVerticalManager {
             return false;
         }
 
-        // Sort items in row-major order: Row 0 (Col 0, 1, 2), Row 1 (Col 0, 1, 2), ...
-        // Using Y/80 to group into rows (spacing is ~149px)
         allItems.Sort((a, b) => {
             int rowA = a.Y / 80;
             int rowB = b.Y / 80;
@@ -339,7 +695,7 @@ public class DesktopVerticalManager {
         int targetPos = isRight ? (curPos + 1) : (curPos - 1);
         if (targetPos < 0 || targetPos >= allItems.Count) {
             CloseHandle(hProc);
-            return true; // Reached boundary
+            return true;
         }
 
         int minP = Math.Min(anchorPos, targetPos);
@@ -347,14 +703,12 @@ public class DesktopVerticalManager {
         int oldMinP = Math.Min(anchorPos, curPos);
         int oldMaxP = Math.Max(anchorPos, curPos);
 
-        // Deselect items that left the range
         for (int p = oldMinP; p <= oldMaxP; p++) {
             if (p < minP || p > maxP) {
                 SetItemStateSafely(hProc, hList, allItems[p].Index, 0, (uint)LVIS_SELECTED);
             }
         }
 
-        // Select items in new range & focus target
         for (int p = minP; p <= maxP; p++) {
             uint state = (uint)LVIS_SELECTED;
             uint mask = (uint)LVIS_SELECTED;
@@ -368,431 +722,105 @@ public class DesktopVerticalManager {
         CloseHandle(hProc);
         return true;
     }
-
-    public static void StartHookThread() {
-        if (_hookThread != null && _hookThread.IsAlive) return;
-        _hookThread = new Thread(() => {
-            using (Process curProcess = Process.GetCurrentProcess())
-            using (ProcessModule curModule = curProcess.MainModule) {
-                _hookId = SetWindowsHookEx(WH_KEYBOARD_LL, _proc, GetModuleHandle(curModule.ModuleName), 0);
-            }
-            MSG msg;
-            while (GetMessage(out msg, IntPtr.Zero, 0, 0) > 0) {
-                TranslateMessage(ref msg);
-                DispatchMessage(ref msg);
-            }
-            if (_hookId != IntPtr.Zero) {
-                UnhookWindowsHookEx(_hookId);
-                _hookId = IntPtr.Zero;
-            }
-        });
-        _hookThread.IsBackground = true;
-        _hookThread.Start();
-    }
-
-    public static void StartNativeWatcher(string[] paths) {
-        _debounceTimer = new System.Threading.Timer((state) => {
-            NeedsArrange = true;
-        }, null, Timeout.Infinite, Timeout.Infinite);
-
-        foreach (string path in paths) {
-            if (!Directory.Exists(path)) continue;
-            try {
-                FileSystemWatcher fsw = new FileSystemWatcher(path);
-                fsw.NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.Size | NotifyFilters.LastWrite;
-                fsw.IncludeSubdirectories = false;
-                
-                FileSystemEventHandler changeHandler = (s, e) => {
-                    if (e.Name.EndsWith(".tmp") || e.Name.StartsWith("~$")) return;
-                    _debounceTimer.Change(800, Timeout.Infinite); // 800ms debounce
-                };
-
-                fsw.Created += changeHandler;
-                fsw.Deleted += changeHandler;
-                fsw.Renamed += (s, e) => {
-                    if (e.Name.EndsWith(".tmp") || e.Name.StartsWith("~$")) return;
-                    _debounceTimer.Change(800, Timeout.Infinite);
-                };
-
-                fsw.EnableRaisingEvents = true;
-                _watchers.Add(fsw);
-            } catch {}
-        }
-    }
-
-    public static List<ItemEntry> GetAllItems(out IntPtr outHwnd) {
-        List<ItemEntry> list = new List<ItemEntry>();
-        IntPtr hList = IntPtr.Zero;
-
-        Thread t = new Thread(() => {
-            IntPtr hDefault = OpenDesktop("Default", 0, false, 0x01FF);
-            if (hDefault != IntPtr.Zero) SetThreadDesktop(hDefault);
-            hList = FindListView();
-            if (hList == IntPtr.Zero) return;
-
-            int style = GetWindowLong(hList, GWL_STYLE);
-            if ((style & LVS_AUTOARRANGE) != 0) {
-                SetWindowLong(hList, GWL_STYLE, style & ~LVS_AUTOARRANGE);
-            }
-
-            int count = (int)SendMessage(hList, LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero);
-            uint pid;
-            GetWindowThreadProcessId(hList, out pid);
-            IntPtr hProc = OpenProcess(0x0038, false, pid);
-            if (hProc == IntPtr.Zero) return;
-
-            int bufferSize = 512;
-            IntPtr pMem = VirtualAllocEx(hProc, IntPtr.Zero, (uint)(Marshal.SizeOf(typeof(LVITEM)) + bufferSize), 0x1000, 0x04);
-            IntPtr pText = new IntPtr(pMem.ToInt64() + Marshal.SizeOf(typeof(LVITEM)));
-
-            for (int i = 0; i < count; i++) {
-                LVITEM item = new LVITEM(); item.mask = 1; item.iItem = i; item.pszText = pText; item.cchTextMax = 250;
-                IntPtr written; WriteProcessMemory(hProc, pMem, ref item, (uint)Marshal.SizeOf(typeof(LVITEM)), out written);
-                SendMessage(hList, LVM_GETITEMTEXTW, (IntPtr)i, pMem);
-                byte[] textBuffer = new byte[bufferSize]; IntPtr read; ReadProcessMemory(hProc, pText, textBuffer, (uint)bufferSize, out read);
-                string text = Encoding.Unicode.GetString(textBuffer).Split('\0')[0];
-                list.Add(new ItemEntry { Index = i, Name = text });
-            }
-            VirtualFreeEx(hProc, pMem, 0, 0x8000); CloseHandle(hProc);
-        });
-        t.Start(); t.Join();
-
-        outHwnd = hList;
-        return list;
-    }
-
-    public static void SetItemPosition(IntPtr hListView, int index, int x, int y) {
-        Thread t = new Thread(() => {
-            IntPtr hDefault = OpenDesktop("Default", 0, false, 0x01FF);
-            if (hDefault != IntPtr.Zero) SetThreadDesktop(hDefault);
-            int lParam = (y << 16) | (x & 0xFFFF);
-            SendMessage(hListView, LVM_SETITEMPOSITION, (IntPtr)index, (IntPtr)lParam);
-        });
-        t.Start(); t.Join();
-    }
-
-    public static void RefreshDesktop(IntPtr hListView) {
-        Thread t = new Thread(() => {
-            IntPtr hDefault = OpenDesktop("Default", 0, false, 0x01FF);
-            if (hDefault != IntPtr.Zero) SetThreadDesktop(hDefault);
-            RedrawWindow(hListView, IntPtr.Zero, IntPtr.Zero, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
-        });
-        t.Start(); t.Join();
-    }
 }
 '@
 
-if (-not ([System.Management.Automation.PSTypeName]'DesktopVerticalManager').Type) {
-    Add-Type -TypeDefinition $cSharpCode
+if (-not ([System.Management.Automation.PSTypeName]'DesktopOrganizerDaemon').Type) {
+    Add-Type -TypeDefinition $cSharpSource -ReferencedAssemblies @("System.Windows.Forms")
 }
-Add-Type -AssemblyName System.Windows.Forms
 
-# --- SYSTEM DIRECTORIES (Pure Unicode & Dynamic Detection) ---
-$shellApp = New-Object -ComObject Shell.Application
-$recycleBinTitle = ""
-try { $recycleBinTitle = $shellApp.Namespace(10).Title } catch {}
+if ($DaemonMode) {
+    [DesktopOrganizerDaemon]::RunDaemon()
+    exit 0
+}
 
-$downloadsFolderTitle = ""
-try { $downloadsFolderTitle = $shellApp.Namespace('shell:Downloads').Self.Name } catch {}
+if (-not $BatchPath) {
+    $BatchPath = Join-Path (Get-Location).Path "DesktopOrganizer_Start.bat"
+}
 
-# Detect all Desktop directories (Hyunfield, OneDrive, Standard, Public)
-$desktopDirs = @()
-try {
-    $regVal = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' -ErrorAction SilentlyContinue).Desktop
-    if ($regVal) {
-        $expanded = [Environment]::ExpandEnvironmentVariables($regVal)
-        if (Test-Path -LiteralPath $expanded) { $desktopDirs += $expanded }
+$dataDir = Join-Path $env:LOCALAPPDATA "DesktopOrganizer"
+if (-not (Test-Path -LiteralPath $dataDir)) {
+    New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
+}
+$pidFile = Join-Path $dataDir "desktop_organizer.pid"
+
+# Clean up legacy files
+$scriptDir = Split-Path -Parent $BatchPath
+if ($scriptDir) {
+    $oldPid = Join-Path $scriptDir "desktop_organizer.pid"
+    if (Test-Path -LiteralPath $oldPid) { Remove-Item -LiteralPath $oldPid -Force -ErrorAction SilentlyContinue }
+}
+$startupFolder = [Environment]::GetFolderPath('Startup')
+$oldVbs = Join-Path $startupFolder "DesktopOrganizer_Startup.vbs"
+if (Test-Path -LiteralPath $oldVbs) {
+    Remove-Item -LiteralPath $oldVbs -Force -ErrorAction SilentlyContinue
+}
+
+# Stop existing scheduled task & daemon processes
+$taskName = "DesktopOrganizerDaemon"
+try { Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue } catch {}
+$psProcs = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'"
+foreach ($proc in $psProcs) {
+    if ($proc.ProcessId -eq $PID) { continue }
+    $cmd = $proc.CommandLine
+    if (-not $cmd) { continue }
+    $isTarget = ($cmd -like "*DesktopOrganizer_Start.bat*-DaemonMode*") -or ($cmd -like "*DesktopOrganizerDaemon*")
+    if (-not $isTarget -and $cmd -match '-EncodedCommand\s+([A-Za-z0-9+/=]+)') {
+        try {
+            $decoded = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($matches[1]))
+            if ($decoded -like "*DesktopOrganizer_Start.bat*") { $isTarget = $true }
+        } catch {}
     }
-} catch {}
-
-$userHyunfield = "C:\Users\guswn\OneDrive\Hyunfield"
-if ((Test-Path -LiteralPath $userHyunfield) -and ($desktopDirs -notcontains $userHyunfield)) {
-    $desktopDirs += $userHyunfield
-}
-
-$envDesktop = [Environment]::GetFolderPath('Desktop')
-if ((Test-Path -LiteralPath $envDesktop) -and ($desktopDirs -notcontains $envDesktop)) {
-    $desktopDirs += $envDesktop
-}
-
-$stdDesktop = Join-Path $env:USERPROFILE "Desktop"
-if ((Test-Path -LiteralPath $stdDesktop) -and ($desktopDirs -notcontains $stdDesktop)) {
-    $desktopDirs += $stdDesktop
-}
-
-$downloadDirs = @()
-$oneDriveDownloads = Join-Path $env:USERPROFILE "OneDrive\다운로드"
-if (Test-Path -LiteralPath $oneDriveDownloads) { $downloadDirs += $oneDriveDownloads }
-try {
-    $stdDownloads = $shellApp.Namespace('shell:Downloads').Self.Path
-    if ((Test-Path -LiteralPath $stdDownloads) -and ($downloadDirs -notcontains $stdDownloads)) { $downloadDirs += $stdDownloads }
-} catch {}
-
-# --- FUNCTION: FIX JAMO (NFD -> NFC) ---
-function Fix-JamoNormalization {
-    param([string[]]$targetDirectories)
-    
-    foreach ($dir in $targetDirectories) {
-        if (-not (Test-Path -LiteralPath $dir)) { continue }
-        $entries = Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue
-        foreach ($entry in $entries) {
-            $rawName = $entry.Name
-            $nfcName = $rawName.Normalize([System.Text.NormalizationForm]::FormC)
-            if ($rawName -ne $nfcName) {
-                $parent = $entry.DirectoryName
-                if (-not $parent) { $parent = $entry.Parent.FullName }
-                $tempName = "jamo_tmp_" + [System.Guid]::NewGuid().ToString("N")
-                $tempPath = Join-Path $parent $tempName
-                $finalPath = Join-Path $parent $nfcName
-                
-                try {
-                    Move-Item -LiteralPath $entry.FullName -Destination $tempPath -Force -ErrorAction Stop
-                    Move-Item -LiteralPath $tempPath -Destination $finalPath -Force -ErrorAction Stop
-                    Write-Host "  [Jamo Fixed] $rawName -> $nfcName"
-                } catch {
-                    Write-Host "  [Jamo Skip] Locked or syncing: $rawName"
-                }
-            }
-        }
+    if ($isTarget) {
+        Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
     }
 }
 
-# --- FUNCTION: ARRANGE DESKTOP (EXACT 3-COLUMN SEAMLESS MATCH) ---
-function Invoke-DesktopArrangement {
-    $hListView = [IntPtr]::Zero
-    $rawItems = [DesktopVerticalManager]::GetAllItems([ref]$hListView)
-    if ($hListView -eq [IntPtr]::Zero -or $rawItems.Count -eq 0) {
-        Write-Host "  [Arrange Warning] Desktop ListView not found."
-        return
-    }
+Write-Host "[1/3] Running immediate 3-column arrangement and Jamo check..."
+$summary = [DesktopOrganizerDaemon]::RunOnce()
+Write-Host "  [OK] $summary"
 
-    $col1List = @()
-    $col2List = @()
-    $col3List = @()
+Write-Host "[2/3] Registering interactive Windows startup task (no VBS, no black window)..."
+$daemonScript = "& { `$p = '$BatchPath'; & ([scriptblock]::Create((Get-Content -LiteralPath `$p -Encoding UTF8 -Raw))) -DaemonMode -BatchPath `$p }"
+$bytes = [System.Text.Encoding]::Unicode.GetBytes($daemonScript)
+$encoded = [Convert]::ToBase64String($bytes)
 
-    $folders = @()
-    $files = @()
+# Remove old HKCU Run entry if present (ScheduledTask handles logon cleanly without console flash)
+$runKeyPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+if (Get-ItemProperty -Path $runKeyPath -Name "DesktopOrganizer" -ErrorAction SilentlyContinue) {
+    Remove-ItemProperty -Path $runKeyPath -Name "DesktopOrganizer" -Force -ErrorAction SilentlyContinue
+}
 
-    $strDownloads = (-join [char[]]@(0xB2E4, 0xC6B4, 0xB85C, 0xB4DC))
-    $strRecycle = (-join [char[]]@(0xD734, 0xC9C0, 0xD1B5))
-    $strMod = (-join [char[]]@(0xC218, 0xC815))
-    $strChef = (-join [char[]]@(0xD658, 0xC0DD, 0xC170, 0xD504))
-    $strHwa = [string][char]0xD654
+$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-STA -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $encoded"
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+Write-Host "  [OK] Registered Scheduled Task: $taskName"
 
-    foreach ($item in $rawItems) {
-        $name = $item.Name.Trim()
-        
-        $isDir = $false
-        foreach ($d in $desktopDirs) {
-            $checkPath = Join-Path $d $name
-            if (Test-Path -LiteralPath $checkPath -PathType Container) {
-                $isDir = $true
+Write-Host "[3/3] Starting continuous interactive daemon..."
+Start-ScheduledTask -TaskName $taskName
+Start-Sleep -Milliseconds 1500
+
+$daemonPid = $null
+$psAfter = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'"
+foreach ($proc in $psAfter) {
+    if ($proc.ProcessId -eq $PID) { continue }
+    $cmd = $proc.CommandLine
+    if ($cmd -and $cmd -match '-EncodedCommand\s+([A-Za-z0-9+/=]+)') {
+        try {
+            $decoded = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($matches[1]))
+            if ($decoded -like "*DesktopOrganizer_Start.bat*") {
+                $daemonPid = $proc.ProcessId
                 break
             }
-        }
-
-        $obj = [PSCustomObject]@{
-            Index = $item.Index
-            Name = $name
-            IsDir = $isDir
-        }
-
-        $isDownloads = (($downloadsFolderTitle -and ($name -like "$downloadsFolderTitle*")) -or ($name -like "*$strDownloads*") -or ($name -like "*Downloads*"))
-        $isRecycle = (($recycleBinTitle -and ($name -eq $recycleBinTitle)) -or ($name -eq "Recycle Bin") -or ($name -eq $strRecycle))
-
-        if ($isDownloads) {
-            $col1List += $obj
-        }
-        elseif ($isRecycle) {
-            $col2List += $obj
-        }
-        elseif ($isDir) {
-            $folders += $obj
-        }
-        else {
-            $files += $obj
-        }
-    }
-
-    $folders = $folders | Sort-Object Name
-    foreach ($f in $folders) {
-        if ($f.Name -like "*officedocs*") {
-            $col1List += $f
-        }
-        elseif ($f.Name -like "*workspace*") {
-            $col2List += $f
-        }
-        elseif ($f.Name -like "*games*" -or $f.Name -like "*$strChef*") {
-            $col3List += $f
-        }
-        else {
-            if ($col1List.Count -le $col2List.Count -and $col1List.Count -le $col3List.Count) { $col1List += $f }
-            elseif ($col2List.Count -le $col3List.Count) { $col2List += $f }
-            else { $col3List += $f }
-        }
-    }
-
-    $files = $files | Sort-Object Name
-    foreach ($file in $files) {
-        $n = $file.Name
-        if ($n -like "*$strMod*2*" -or ($n -like "*$strMod*1*" -and $n -like "*020*")) {
-            $col1List += $file
-        }
-        elseif ($n -like "*KakaoTalk*" -or $n -like "*018$strHwa.*" -or $n -like "*020.*" -or $n -like "*020$strHwa.*") {
-            $col2List += $file
-        }
-        elseif ($n -like "*019*" -or $n -like "*19$strHwa*") {
-            $col3List += $file
-        }
-        else {
-            if ($col1List.Count -le $col2List.Count -and $col1List.Count -le $col3List.Count) { $col1List += $file }
-            elseif ($col2List.Count -le $col3List.Count) { $col2List += $file }
-            else { $col3List += $file }
-        }
-    }
-
-    # Strict height balancing: guarantee equal column count (e.g. 4 / 4 / 4)
-    $targetPerCol = [int][Math]::Ceiling($rawItems.Count / 3.0)
-    while ($col3List.Count -gt $targetPerCol -and ($col2List.Count -lt $targetPerCol -or $col1List.Count -lt $targetPerCol)) {
-        if ($col2List.Count -lt $targetPerCol) {
-            $col2List += $col3List[-1]
-            $col3List = @($col3List[0..($col3List.Count - 2)])
-        } elseif ($col1List.Count -lt $targetPerCol) {
-            $col1List += $col3List[-1]
-            $col3List = @($col3List[0..($col3List.Count - 2)])
-        } else { break }
-    }
-    while ($col1List.Count -gt $targetPerCol -and ($col2List.Count -lt $targetPerCol -or $col3List.Count -lt $targetPerCol)) {
-        if ($col2List.Count -lt $targetPerCol) {
-            $col2List += $col1List[-1]
-            $col1List = @($col1List[0..($col1List.Count - 2)])
-        } elseif ($col3List.Count -lt $targetPerCol) {
-            $col3List += $col1List[-1]
-            $col1List = @($col1List[0..($col1List.Count - 2)])
-        } else { break }
-    }
-
-    $colX = @(5, 111, 217)
-    $startY = 2
-    $spacingY = 149
-
-    for ($r = 0; $r -lt $col1List.Count; $r++) {
-        $y = $startY + ($r * $spacingY)
-        [DesktopVerticalManager]::SetItemPosition($hListView, $col1List[$r].Index, $colX[0], $y)
-    }
-
-    for ($r = 0; $r -lt $col2List.Count; $r++) {
-        $y = $startY + ($r * $spacingY)
-        [DesktopVerticalManager]::SetItemPosition($hListView, $col2List[$r].Index, $colX[1], $y)
-    }
-
-    for ($r = 0; $r -lt $col3List.Count; $r++) {
-        $y = $startY + ($r * $spacingY)
-        [DesktopVerticalManager]::SetItemPosition($hListView, $col3List[$r].Index, $colX[2], $y)
-    }
-
-    [DesktopVerticalManager]::RefreshDesktop($hListView)
-    Write-Host "  [Arranged] Successfully matched 3-column vertical grid without gaps! (Col1: $($col1List.Count), Col2: $($col2List.Count), Col3: $($col3List.Count))"
-}
-
-# --- FUNCTION: ONE-SHOT PIPELINE ---
-function Execute-OrganizePipeline {
-    Write-Host "[1/2] Resolving Jamo Decomposition..."
-    Fix-JamoNormalization -targetDirectories ($desktopDirs + $downloadDirs)
-
-    Write-Host "[2/2] Arranging Desktop in 3 Vertical Columns..."
-    Invoke-DesktopArrangement
-}
-
-# --- FUNCTION: CONFIGURE STARTUP & SPAWN BACKGROUND PROCESS ---
-function Setup-StartupAndDaemon {
-    if (-not $BatchPath) {
-        $BatchPath = Join-Path (Get-Location).Path "DesktopOrganizer_Start.bat"
-    }
-    $scriptDir = Split-Path -Parent $BatchPath
-    if (-not $scriptDir) { $scriptDir = (Get-Location).Path }
-    
-    # Startup folder
-    $startupFolder = [Environment]::GetFolderPath('Startup')
-    $vbsPath = Join-Path $startupFolder "DesktopOrganizer_Startup.vbs"
-    
-    $vbsContent = "Set WshShell = CreateObject(`"WScript.Shell`")`nWshShell.Run `"`"`"$BatchPath`"`" -daemon`", 0, False"
-    [System.IO.File]::WriteAllText($vbsPath, $vbsContent, [System.Text.Encoding]::ASCII)
-    Write-Host "[Startup] Registered silent boot trigger at shell:startup"
-
-    # Spawn background daemon if not already running
-    $pidFile = Join-Path $scriptDir "desktop_organizer.pid"
-    $isRunning = $false
-    if (Test-Path -LiteralPath $pidFile) {
-        $savedPid = Get-Content -LiteralPath $pidFile -Raw
-        if ($savedPid -and (Get-Process -Id ([int]$savedPid.Trim()) -ErrorAction SilentlyContinue)) {
-            $isRunning = $true
-        }
-    }
-
-    if (-not $isRunning) {
-        $scriptText = "& { `$p = '$BatchPath'; & ([scriptblock]::Create((Get-Content -LiteralPath `$p -Encoding UTF8 -Raw))) -DaemonMode -BatchPath `$p }"
-        $bytes = [System.Text.Encoding]::Unicode.GetBytes($scriptText)
-        $encoded = [Convert]::ToBase64String($bytes)
-        $daemonCmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $encoded"
-        
-        $spawned = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine = $daemonCmd}
-        if ($spawned.ProcessId) {
-            [System.IO.File]::WriteAllText($pidFile, $spawned.ProcessId.ToString(), [System.Text.Encoding]::ASCII)
-            Write-Host "[Daemon] Background monitor & vertical selection hook spawned (PID: $($spawned.ProcessId))."
-        } else {
-            # Fallback to WScript.Shell
-            $wsh = New-Object -ComObject WScript.Shell
-            $wsh.Run($daemonCmd, 0, $false)
-            Write-Host "[Daemon] Background monitor & vertical selection hook spawned."
-        }
-    } else {
-        Write-Host "[Daemon] Background monitor daemon is already running."
+        } catch {}
     }
 }
 
-# --- FUNCTION: BACKGROUND WATCHER & VERTICAL SELECTION HOOK DAEMON ---
-function Start-BackgroundWatcher {
-    $scriptDir = Split-Path -Parent $BatchPath
-    if (-not $scriptDir) { $scriptDir = (Get-Location).Path }
-    $pidFile = Join-Path $scriptDir "desktop_organizer.pid"
-    [System.IO.File]::WriteAllText($pidFile, $PID.ToString(), [System.Text.Encoding]::ASCII)
-
-    $logPath = Join-Path $env:TEMP "DesktopOrganizer_daemon.log"
-    Add-Content -LiteralPath $logPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Daemon started with native watcher & keyboard hook. PID: $PID" -Force
-    
-    try {
-        Execute-OrganizePipeline
-    } catch {
-        Add-Content -LiteralPath $logPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Initial pipeline error: $($_.Exception.ToString())"
-    }
-
-    # Start Native C# FileSystemWatcher on all Desktop directories
-    [DesktopVerticalManager]::StartNativeWatcher($desktopDirs)
-
-    # Start Keyboard Hook in background thread
-    [DesktopVerticalManager]::StartHookThread()
-
-    # Main thread polling loop (Thread-safe)
-    while ($true) {
-        if ([DesktopVerticalManager]::NeedsArrange) {
-            [DesktopVerticalManager]::NeedsArrange = $false
-            Add-Content -LiteralPath $logPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] File change detected. Triggering auto-arrangement..." -Force
-            try {
-                Execute-OrganizePipeline
-                Add-Content -LiteralPath $logPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Auto-arrangement successfully executed." -Force
-            } catch {
-                Add-Content -LiteralPath $logPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Auto-arrangement error: $($_.Exception.ToString())" -Force
-            }
-        }
-        Start-Sleep -Milliseconds 300
-    }
-}
-
-# --- MAIN DISPATCHER ---
-if ($DaemonMode) {
-    Start-BackgroundWatcher
+if ($daemonPid) {
+    [System.IO.File]::WriteAllText($pidFile, $daemonPid.ToString(), [System.Text.Encoding]::ASCII)
+    Write-Host "  [OK] Continuous daemon active in interactive session (PID: $daemonPid)."
 } else {
-    Execute-OrganizePipeline
-    Setup-StartupAndDaemon
+    Write-Host "  [Warning] Daemon did not stay active. Check $env:TEMP\DesktopOrganizer_daemon.log"
 }
